@@ -311,9 +311,32 @@ GET http://[ESP32-IP]/settings?lower=11.0&upper=12.5
 {
   "v_cutoff": 11.00,
   "v_reconnect": 12.50,
+  "calibration_factor": 1.1937,
   "changed": true
 }
 ```
+
+**Calibrate ADC (Auto-calibration - EASIEST METHOD):**
+```
+GET http://[ESP32-IP]/settings?target=13.5
+```
+Just provide the voltage from your multimeter - the code calculates and sets calibration automatically!
+
+**Response:**
+```json
+{
+  "v_cutoff": 12.00,
+  "v_reconnect": 12.90,
+  "calibration_factor": 1.1937,
+  "changed": true
+}
+```
+
+**Calibrate ADC (Manual - if you know the factor):**
+```
+GET http://[ESP32-IP]/settings?calibrate=1.1937
+```
+Use this if you've already calculated the calibration factor manually.
 
 **Control relay:**
 ```
