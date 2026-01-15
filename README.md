@@ -136,6 +136,28 @@ const char* WIFI_PASS = "YourPassword";
 
 ---
 
+## How To Calibrate ADC (One-Time Setup Per Device)
+
+**EASIEST METHOD - Auto-Calibration:**
+
+1. Measure actual battery voltage with multimeter (e.g., 13.5V)
+2. Send this command:
+   ```
+   http://[ESP32-IP]/settings?target=13.5
+   ```
+3. Done! The code automatically calculates and saves calibration.
+
+**Calibration persists across reboots** - you only need to do this once per device.
+
+**For multiple devices:** Upload same code to all, then calibrate each one:
+- Device 1: `http://10.17.195.65/settings?target=13.5`
+- Device 2: `http://10.17.195.66/settings?target=13.5`
+- Device 3: `http://10.17.195.67/settings?target=13.5`
+
+Each device saves its own calibration automatically. No code changes needed!
+
+---
+
 ## How To Change Voltage Thresholds
 
 ### Method 1: Edit the Code (Permanent Change)
