@@ -173,7 +173,7 @@ const float RBOT = 10000.0;   // Bottom resistor (ADC node to GND) in Ohms
 const float VREF = 3.3;       // ESP32 reference voltage (nominal, but varies per chip)
 const int ADC_MAX = 4095;     // 12-bit ADC resolution (0-4095)
 float CALIBRATION_FACTOR = 1.0;  // Calibration factor (1.0 = no calibration, adjust as needed)
-const int SAMPLES = 150;      // Number of samples to average for stable reading (increased to reduce tenths place noise)
+const int SAMPLES = 200;      // Number of samples to average for stable reading (increased for maximum stability)
 
 // ============================================================================
 // BATTERY PROTECTION THRESHOLDS - CUSTOMIZE THESE FOR YOUR NEEDS
@@ -263,8 +263,8 @@ const int MAX_CYCLE_COUNT = 10000;      // Reset cycle count at this value
 const unsigned long FORTY_EIGHT_HOURS_MS = 48UL * 60UL * 60UL * 1000UL; // 48 hours in milliseconds
 
 // Moving average for ultra-stable voltage display
-const int DISPLAY_SAMPLES = 20;  // Increased for better stability in tenths place
-float voltageHistory[20] = {0};
+const int DISPLAY_SAMPLES = 30;  // Increased for maximum stability (30 samples = 7.5 seconds of history)
+float voltageHistory[30] = {0};
 int voltageIndex = 0;
 bool historyInitialized = false;  // Track if buffer is filled
 
@@ -358,9 +358,9 @@ float smoothVoltage(float newVoltage) {
   
   float average = sum / samplesToUse;
   
-  // Round to nearest 0.01V to reduce flickering in tenths place
-  // This helps stabilize the display while maintaining accuracy
-  return round(average * 100.0) / 100.0;
+  // Round to nearest 0.05V for ultra-stable display (reduces minor fluctuations)
+  // This helps stabilize the display significantly while maintaining reasonable accuracy
+  return round(average * 20.0) / 20.0;
 }
 
 // ============================================================================
@@ -381,16 +381,46 @@ float smoothVoltage(float newVoltage) {
  * - ADC reading → voltage at pin: Vadc = (ADC / ADC_MAX) × VREF
  * - Pin voltage → battery voltage: Vbat = Vadc × ((RTOP + RBOT) / RBOT)
  */
+/**
+ * Helper function to sort array for median calculation
+ */
+void sortArray(float arr[], int n) {
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (arr[j] > arr[j + 1]) {
+        float temp = arr[j];
+        arr[j] = arr[j + 1];
+        arr[j + 1] = temp;
+      }
+    }
+  }
+}
+
 float readBatteryVoltage() {
-  // Take multiple samples for averaging (reduces noise and spikes)
-  long sum = 0;
+  // Take multiple samples for median filtering (removes outliers) + averaging
+  float samples[SAMPLES];
+  
   for (int i = 0; i < SAMPLES; i++) {
-    sum += analogRead(ADC_PIN);
-    delayMicroseconds(200);  // Small delay between samples
+    samples[i] = (float)analogRead(ADC_PIN);
+    delayMicroseconds(500);  // Increased delay to allow ADC to settle (reduces noise)
   }
   
-  // Calculate average ADC reading
-  float avgADC = (float)sum / (float)SAMPLES;
+  // Sort samples to find median (removes outliers from noise/spikes)
+  sortArray(samples, SAMPLES);
+  
+  // Use median of middle 80% (discard top 10% and bottom 10% to remove extreme outliers)
+  int discard = SAMPLES / 10;
+  int start = discard;
+  int end = SAMPLES - discard;
+  int count = end - start;
+  
+  long sum = 0;
+  for (int i = start; i < end; i++) {
+    sum += (long)samples[i];
+  }
+  
+  // Calculate average of trimmed samples
+  float avgADC = (float)sum / (float)count;
   
   // Convert ADC value to voltage at the pin
   float vAdc = (avgADC / (float)ADC_MAX) * VREF;
@@ -797,9 +827,13 @@ void setup() {
   // Configure relay pin as output
   pinMode(RELAY_PIN, OUTPUT);
   
-  // Configure ADC settings
+  // Configure ADC settings for maximum stability
   analogReadResolution(12);                     // 12-bit resolution (0-4095)
   analogSetPinAttenuation(ADC_PIN, ADC_11db);  // 11dB attenuation (0-~3.3V, non-linear)
+  
+  // Reduce WiFi TX power to minimize interference with ADC readings
+  // Lower power = less noise on power rail = more stable ADC
+  WiFi.setTxPower(WIFI_POWER_11dBm);  // Reduce from default 19.5dBm to minimize interference
   
   Serial.println("ADC configured: 12-bit, 11dB attenuation");
   
