@@ -134,6 +134,19 @@ const char* WIFI_PASS = "YourPassword";
 4. Note the IP address printed (e.g., 10.17.195.65)
 5. Open that IP in your web browser
 
+### Step 6: Calibrate ADC (One-Time Setup)
+
+**IMPORTANT:** Each ESP32 chip needs calibration. Do this once per device:
+
+1. Measure actual battery voltage with multimeter (e.g., 13.5V)
+2. Send auto-calibration command:
+   ```
+   http://[ESP32-IP]/settings?target=13.5
+   ```
+3. Done! Calibration is saved automatically and persists after reboot.
+
+**For multiple devices:** Upload same code to all, then calibrate each device individually. Each device saves its own calibration.
+
 ---
 
 ## How To Calibrate ADC (One-Time Setup Per Device)
@@ -223,20 +236,27 @@ curl "http://10.17.195.65/settings?lower=11.0&upper=12.0"
 }
 ```
 
-**Calibrate ADC (adjust voltage readings):**
+**Auto-Calibrate ADC (EASIEST - just provide multimeter reading):**
 ```
-GET http://[ESP32-IP]/settings?calibrate=1.016
+GET http://[ESP32-IP]/settings?target=13.5
 ```
+The code automatically calculates and sets the calibration factor. No math needed!
 
 **Response:**
 ```json
 {
-  "v_cutoff": 11.00,
+  "v_cutoff": 12.00,
   "v_reconnect": 12.90,
-  "calibration_factor": 1.0160,
+  "calibration_factor": 1.3364,
   "changed": true
 }
 ```
+
+**Manual Calibrate ADC (if you know the factor):**
+```
+GET http://[ESP32-IP]/settings?calibrate=1.3364
+```
+Use this only if you've already calculated the calibration factor manually.
 
 **The system immediately re-evaluates:**
 - If current voltage ≤ new cutoff → load turns OFF instantly
@@ -506,9 +526,11 @@ const float RBOT = 10000.0;   // Change to your measured value
 | Relay type | NO (Normally Open) |
 | Voltage measurement rate | 4 Hz (every 250ms) |
 | Web update rate | 1 Hz (every 1 second) |
-| Smoothing | 150 sample average + 20 point moving average |
-| ADC calibration | Adjustable factor (default 1.0) |
+| Smoothing | 200 sample average + 30 point moving average + median filtering |
+| ADC calibration | Auto-calibration via web API, persists across reboots |
+| Calibration method | `/settings?target=13.5` (automatic) or `/settings?calibrate=1.3364` (manual) |
 | WiFi | 2.4GHz only (ESP32 limitation) |
+| WiFi TX power | Reduced to 11dBm (minimizes ADC interference) |
 
 ---
 
@@ -535,6 +557,22 @@ This is well below the 3.3V maximum for ESP32 ADC. Safe operation confirmed.
 
 ---
 
+## Calibration Notes
+
+**Why calibration is needed:**
+- ESP32 ADC reference voltage varies from chip to chip (1000mV-1200mV)
+- Each device needs its own calibration factor
+- Calibration is saved to flash memory and persists across reboots
+
+**How to calibrate:**
+- **Easiest:** Use auto-calibration: `http://[ESP32-IP]/settings?target=13.5`
+- **Manual:** Calculate factor yourself: `http://[ESP32-IP]/settings?calibrate=1.3364`
+
+**For multiple devices:**
+- Upload same code to all devices
+- Calibrate each device individually (each has different ADC characteristics)
+- Each device saves its own calibration automatically
+
 ## Safety Notes
 
 1. Check battery voltage rating before connecting
@@ -542,8 +580,9 @@ This is well below the 3.3V maximum for ESP32 ADC. Safe operation confirmed.
 3. Verify relay current rating matches your load
 4. Use appropriate wire gauge for load current
 5. Test voltage reading with multimeter before connecting load
-6. Never short circuit battery terminals
-7. Double-check wiring before powering on
+6. Calibrate ADC before relying on voltage readings
+7. Never short circuit battery terminals
+8. Double-check wiring before powering on
 
 ---
 
