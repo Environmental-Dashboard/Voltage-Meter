@@ -399,24 +399,35 @@ date -r $((TIMESTAMP / 1000))
 
 **Problem:** Displayed voltage doesn't match multimeter
 
-**Fix 1: Calibrate the ADC**
+**Fix 1: Auto-Calibrate the ADC (EASIEST METHOD)**
 
-The ESP32 ADC reference voltage varies from chip to chip (1000mV to 1200mV), causing reading inaccuracies. Calibrate using these steps:
+The ESP32 ADC reference voltage varies from chip to chip (1000mV to 1200mV), causing reading inaccuracies. Use auto-calibration:
 
-1. Measure actual battery voltage with a multimeter (e.g., 12.50V)
-2. Check displayed voltage on web interface (e.g., 12.30V)
+1. Measure actual battery voltage with a multimeter (e.g., 13.5V)
+2. Set calibration automatically:
+   ```
+   http://[ESP32-IP]/settings?target=13.5
+   ```
+   The code automatically calculates and sets the calibration factor!
+3. Verify: Display should now show ~13.5V
+4. Calibration is saved automatically and persists after reboot
+
+**Fix 2: Manual Calibration (if you prefer)**
+
+1. Measure actual battery voltage with a multimeter (e.g., 13.5V)
+2. Check displayed voltage on web interface (e.g., 11.8V)
 3. Calculate calibration factor:
    ```
    factor = measured_voltage / displayed_voltage
-   factor = 12.50 / 12.30 = 1.016
+   factor = 13.5 / 11.8 = 1.1441
    ```
 4. Set calibration via web API:
    ```
-   http://[ESP32-IP]/settings?calibrate=1.016
+   http://[ESP32-IP]/settings?calibrate=1.1441
    ```
-5. Verify: Display should now show ~12.50V
+5. Verify: Display should now show ~13.5V
 
-**Fix 2: Verify resistor values**
+**Fix 3: Verify resistor values**
 
 If calibration doesn't help, check resistor values. Measure each resistor with multimeter:
 - Top resistor should be 100kΩ (Brown-Black-Yellow)
