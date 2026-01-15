@@ -615,18 +615,18 @@ void handleSettings() {
   // IMPORTANT: Re-evaluate load state immediately after threshold change
   // This ensures the system responds to new thresholds right away
   if (changed && autoMode) {
-    if (lastVBat <= V_CUTOFF) {
-      // Below cutoff - turn OFF
-      if (loadEnabled) {
-        applyLoadState(false);
-        Serial.println("! Threshold change triggered: Load turned OFF");
-      }
-    }
-    else if (lastVBat >= V_RECONNECT) {
-      // Above reconnect - turn ON
+    if (lastVBat > V_CUTOFF) {
+      // Voltage above cutoff - turn ON
       if (!loadEnabled) {
         applyLoadState(true);
         Serial.println("! Threshold change triggered: Load turned ON");
+      }
+    }
+    else {
+      // Voltage at or below cutoff - turn OFF
+      if (loadEnabled) {
+        applyLoadState(false);
+        Serial.println("! Threshold change triggered: Load turned OFF");
       }
     }
   }
@@ -756,21 +756,20 @@ void loop() {
     lastVBat = smoothVoltage(rawVoltage);  // Ultra-stable display value
     
     // Automatic control (only if in auto mode)
-    // Simple logic: turn OFF when voltage drops to or below cutoff,
-    // turn ON when voltage rises to or above reconnect threshold
+    // Simple logic: if voltage > cutoff threshold → ON, else → OFF
     if (autoMode) {
-      if (lastVBat <= V_CUTOFF) {
-        // Voltage is at or below cutoff - turn OFF
-        if (loadEnabled) {
-          Serial.println("! CUTOFF: Battery voltage low, disconnecting load");
-          applyLoadState(false);
+      if (lastVBat > V_CUTOFF) {
+        // Voltage is above cutoff - turn ON
+        if (!loadEnabled) {
+          Serial.println("! RECONNECT: Battery voltage above threshold, turning load ON");
+          applyLoadState(true);
         }
       }
-      else if (lastVBat >= V_RECONNECT) {
-        // Voltage is at or above reconnect - turn ON
-        if (!loadEnabled) {
-          Serial.println("! RECONNECT: Battery voltage recovered, reconnecting load");
-          applyLoadState(true);
+      else {
+        // Voltage is at or below cutoff - turn OFF
+        if (loadEnabled) {
+          Serial.println("! CUTOFF: Battery voltage at or below threshold, turning load OFF");
+          applyLoadState(false);
         }
       }
     }

@@ -10,11 +10,10 @@ View the complete wiring diagram here: [Cirkit Designer - Battery Monitor Wiring
 
 ## What It Does
 
-Monitors your battery voltage continuously. When voltage drops at or below the cutoff threshold (default: 12.0V), it turns OFF your load. When voltage rises to or above the reconnect threshold (default: 12.9V), it turns the load back ON.
+Monitors your battery voltage continuously. Simple logic: when voltage is above the cutoff threshold (default: 12.0V), load is ON. When voltage drops to or below the threshold, load turns OFF.
 
 **Current Default Settings:**
-- Turns OFF at: 12.0V
-- Turns ON at: 12.9V  
+- Cutoff threshold: 12.0V (load OFF if voltage is at or below this)
 - Relay Type: NO (Normally Open)
 - Relay Pin: GPIO27
 
@@ -165,30 +164,30 @@ float V_RECONNECT = 13.2;  // Wait for full charge
 
 ### Method 2: Change via Web API (Temporary Until Restart)
 
-Send HTTP request to change thresholds on the fly:
+Send HTTP request to change the cutoff threshold on the fly:
 
-**Set cutoff to 11V, reconnect at 12V:**
+**Set cutoff to 11V:**
 ```
-http://[ESP32-IP]/settings?lower=11.0&upper=12.0
+http://[ESP32-IP]/settings?lower=11.0
 ```
 
 **Example with curl:**
 ```bash
-curl "http://10.17.195.65/settings?lower=11.0&upper=12.0"
+curl "http://10.17.195.65/settings?lower=11.0"
 ```
 
 **Response:**
 ```json
 {
   "v_cutoff": 11.00,
-  "v_reconnect": 12.00,
+  "v_reconnect": 12.90,
   "changed": true
 }
 ```
 
-**The system will immediately apply the new thresholds:**
-- If voltage is now below the new cutoff, load turns OFF instantly
-- If voltage is now above the new reconnect, load turns ON instantly
+**The system will immediately apply the new threshold:**
+- If voltage is now above the new cutoff, load turns ON instantly
+- If voltage is now at or below the new cutoff, load turns OFF instantly
 
 ---
 
@@ -212,28 +211,18 @@ Open your browser to the ESP32 IP address (e.g., http://10.17.195.65)
 
 ## How The Control Logic Works
 
-**In AUTO mode:**
-1. If voltage drops to or below CUTOFF → Load turns OFF
-2. If voltage rises to or above RECONNECT → Load turns ON
-3. If voltage is between CUTOFF and RECONNECT → Load stays in current state
+**In AUTO mode (Simple Logic):**
+- If voltage is **above** cutoff threshold → Load is **ON**
+- If voltage is **at or below** cutoff threshold → Load is **OFF**
 
-**Example with defaults (cutoff=12.0V, reconnect=12.9V):**
-- Voltage at 13.0V → Load ON
-- Voltage drops to 12.5V → Load stays ON (above cutoff)
-- Voltage drops to 12.0V → Load turns OFF (at cutoff)
-- Voltage stays at 12.3V → Load stays OFF (below reconnect)
-- Voltage rises to 12.9V → Load turns ON (at reconnect)
+**Example with cutoff at 11.0V:**
+- Voltage at 13.0V → Load ON (above 11.0V)
+- Voltage at 11.5V → Load ON (above 11.0V)
+- Voltage drops to 11.0V → Load turns OFF (at threshold)
+- Voltage drops to 10.8V → Load stays OFF (below threshold)
+- Voltage rises to 11.1V → Load turns ON (above threshold)
 
-**Why use two thresholds?**
-
-Prevents rapid on/off cycling. Without a gap between cutoff and reconnect:
-- Load turns off at 12.0V
-- Battery voltage immediately rises (no load)
-- Load turns back on
-- Voltage drops again
-- Relay clicks on/off repeatedly (bad for relay and battery)
-
-With a gap (12.0V cutoff, 12.9V reconnect), the battery must fully recover before reconnecting.
+The system continuously checks the voltage and immediately responds to changes.
 
 ---
 
