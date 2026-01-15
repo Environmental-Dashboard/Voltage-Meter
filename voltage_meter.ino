@@ -655,21 +655,12 @@ void handleSettings() {
       }
     }
     else if (lastVBat > V_CUTOFF) {
-      // Voltage is above cutoff
+      // Voltage is above cutoff - should be ON
+      // When thresholds change, if voltage > new cutoff, turn ON immediately
+      // (ignore reconnect threshold when user manually changes thresholds)
       if (!loadEnabled) {
-        // Load is OFF - need to reach reconnect to turn ON
-        if (lastVBat >= V_RECONNECT) {
-          Serial.println("  -> Turning load ON (voltage at or above reconnect)");
-          applyLoadState(true);
-        } else {
-          Serial.print("  -> Load stays OFF (voltage above cutoff but below reconnect: ");
-          Serial.print(V_CUTOFF, 2);
-          Serial.print("V < ");
-          Serial.print(lastVBat, 2);
-          Serial.print("V < ");
-          Serial.print(V_RECONNECT, 2);
-          Serial.println("V)");
-        }
+        Serial.println("  -> Turning load ON (voltage above new cutoff threshold)");
+        applyLoadState(true);
       }
       else {
         // Load is ON and voltage > cutoff - keep it ON
@@ -810,7 +801,8 @@ void loop() {
     lastVBat = smoothVoltage(rawVoltage);  // Ultra-stable display value
     
     // Automatic control (only if in auto mode)
-    // Improved hysteresis logic: voltage > cutoff = ON, but use reconnect when recovering from OFF
+    // Logic: voltage > cutoff = ON, voltage <= cutoff = OFF
+    // Reconnect threshold only prevents rapid cycling when recovering from OFF
     if (autoMode) {
       if (lastVBat <= V_CUTOFF) {
         // Voltage at or below cutoff - turn OFF
@@ -824,9 +816,10 @@ void loop() {
         }
       }
       else if (lastVBat > V_CUTOFF) {
-        // Voltage is above cutoff
+        // Voltage is above cutoff - should be ON
         if (!loadEnabled) {
-          // Load is currently OFF - need to reach reconnect threshold to turn back ON
+          // Load is currently OFF - check if we should turn it ON
+          // Use reconnect threshold to prevent rapid cycling
           if (lastVBat >= V_RECONNECT) {
             Serial.print("! RECONNECT: Battery voltage (");
             Serial.print(lastVBat, 2);
@@ -835,10 +828,11 @@ void loop() {
             Serial.println("V), turning load ON");
             applyLoadState(true);
           }
+          // If voltage is between cutoff and reconnect, stay OFF (hysteresis)
         }
         else {
-          // Load is currently ON and voltage is above cutoff - keep it ON
-          // This ensures if voltage > cutoff, load stays ON
+          // Load is ON and voltage > cutoff - keep it ON
+          // This is the key fix: if voltage > cutoff, load should be ON
         }
       }
     }
