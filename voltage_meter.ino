@@ -164,8 +164,15 @@ const float RTOP = 100000.0;  // Top resistor (Battery+ to ADC node) in Ohms
 const float RBOT = 10000.0;   // Bottom resistor (ADC node to GND) in Ohms
 
 // ADC Configuration
-const float VREF = 3.3;       // ESP32 reference voltage (typically 3.3V)
+// ADC Calibration
+// ESP32 ADC reference voltage varies from chip to chip (typically 1.0V to 1.2V)
+// This calibration factor corrects for this variation
+// To calibrate: Measure actual battery voltage with multimeter, then adjust CALIBRATION_FACTOR
+// Formula: CALIBRATION_FACTOR = (MeasuredVoltage / DisplayedVoltage)
+// Example: If multimeter shows 12.50V but display shows 12.30V, factor = 12.50/12.30 = 1.016
+const float VREF = 3.3;       // ESP32 reference voltage (nominal, but varies per chip)
 const int ADC_MAX = 4095;     // 12-bit ADC resolution (0-4095)
+float CALIBRATION_FACTOR = 1.0;  // Calibration factor (1.0 = no calibration, adjust as needed)
 const int SAMPLES = 150;      // Number of samples to average for stable reading (increased to reduce tenths place noise)
 
 // ============================================================================
@@ -355,6 +362,10 @@ float readBatteryVoltage() {
   // Apply voltage divider formula to get actual battery voltage
   // Vbat = Vadc × (divider ratio)
   float vBat = vAdc * ((RTOP + RBOT) / RBOT);
+  
+  // Apply calibration factor to correct for ADC reference voltage variation
+  // This compensates for differences in ESP32 chip VREF (typically 1.0V-1.2V)
+  vBat = vBat * CALIBRATION_FACTOR;
   
   return vBat;
 }
@@ -556,6 +567,7 @@ void handleStatus() {
   json += "\"auto_mode\":" + String(autoMode ? "true" : "false") + ",";
   json += "\"v_cutoff\":" + String(V_CUTOFF, 2) + ",";
   json += "\"v_reconnect\":" + String(V_RECONNECT, 2) + ",";
+  json += "\"calibration_factor\":" + String(CALIBRATION_FACTOR, 4) + ",";
   json += "\"uptime_ms\":" + String(millis());
   json += "}";
   server.send(200, "application/json", json);
@@ -627,6 +639,17 @@ void handleSettings() {
     }
   }
   
+  // Accept calibration factor changes
+  if (server.hasArg("calibrate")) {
+    float newCal = server.arg("calibrate").toFloat();
+    if (newCal > 0.8 && newCal < 1.2) {  // Reasonable calibration range
+      CALIBRATION_FACTOR = newCal;
+      changed = true;
+      Serial.print("! CALIBRATION FACTOR CHANGED to: ");
+      Serial.println(CALIBRATION_FACTOR, 4);
+    }
+  }
+  
   // Validate that upper >= lower (can be equal for no hysteresis)
   if (V_RECONNECT < V_CUTOFF) {
     V_RECONNECT = V_CUTOFF;  // Force upper to at least equal lower
@@ -686,6 +709,7 @@ void handleSettings() {
   String json = "{";
   json += "\"v_cutoff\":" + String(V_CUTOFF, 2) + ",";
   json += "\"v_reconnect\":" + String(V_RECONNECT, 2) + ",";
+  json += "\"calibration_factor\":" + String(CALIBRATION_FACTOR, 4) + ",";
   json += "\"changed\":" + String(changed ? "true" : "false");
   json += "}";
   
@@ -743,7 +767,9 @@ void setup() {
   Serial.print(V_CUTOFF);
   Serial.print("V, Reconnect: ");
   Serial.print(V_RECONNECT);
-  Serial.println("V");
+  Serial.print("V, Calibration: ");
+  Serial.print(CALIBRATION_FACTOR, 4);
+  Serial.println(" (1.0 = no calibration)");
   
   // Connect to WiFi
   Serial.println();
