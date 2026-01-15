@@ -690,16 +690,18 @@ void handleRelay() {
 
 /**
  * Handler for "/settings"
- * Allows changing voltage thresholds dynamically
+ * Allows changing voltage thresholds and calibration dynamically
  * 
  * Query parameters:
  * - ?lower=12.0  → Set cutoff voltage (V_CUTOFF)
  * - ?upper=12.9  → Set reconnect voltage (V_RECONNECT)
+ * - ?calibrate=1.1937  → Set calibration factor directly
+ * - ?target=13.5  → Auto-calibrate to target voltage (calculates factor automatically)
  * 
  * Examples:
  * - http://ESP32_IP/settings?lower=11.5&upper=12.5
- * - http://ESP32_IP/settings?lower=12.0
- * - http://ESP32_IP/settings?upper=13.0
+ * - http://ESP32_IP/settings?calibrate=1.1937  (manual calibration)
+ * - http://ESP32_IP/settings?target=13.5  (auto-calibration - easier!)
  * 
  * Returns current settings as JSON
  */
@@ -724,6 +726,7 @@ void handleSettings() {
   }
   
   // Accept calibration factor changes
+  // Method 1: Direct factor setting
   if (server.hasArg("calibrate")) {
     float newCal = server.arg("calibrate").toFloat();
     if (newCal > 0.5 && newCal < 2.0) {  // Extended range to handle larger calibration needs
@@ -739,6 +742,48 @@ void handleSettings() {
       Serial.println(CALIBRATION_FACTOR, 4);
       Serial.println("  Calibration saved to flash memory (will persist after reboot)");
       Serial.println("  Calibration formula: factor = measured_voltage / displayed_voltage");
+    }
+  }
+  
+  // Method 2: Auto-calibration with target voltage (calculates factor automatically)
+  // Usage: /settings?target=13.5
+  // This automatically calculates and sets the calibration factor
+  if (server.hasArg("target")) {
+    float targetVoltage = server.arg("target").toFloat();
+    if (targetVoltage > 8.0 && targetVoltage < 20.0) {  // Reasonable voltage range
+      // Get current reading (with current calibration)
+      float currentReading = lastVBat;
+      
+      if (currentReading > 0.1) {  // Make sure we have a valid reading
+        // Calculate what the calibration factor should be
+        // If current reading is with factor X, and we want target:
+        // target = raw * new_factor
+        // current = raw * old_factor
+        // So: new_factor = old_factor * (target / current)
+        float newFactor = CALIBRATION_FACTOR * (targetVoltage / currentReading);
+        
+        if (newFactor > 0.5 && newFactor < 2.0) {
+          CALIBRATION_FACTOR = newFactor;
+          changed = true;
+          
+          // Save to flash memory
+          preferences.begin("voltmeter", false);
+          preferences.putFloat("cal_factor", CALIBRATION_FACTOR);
+          preferences.end();
+          
+          Serial.print("! AUTO-CALIBRATION:");
+          Serial.print("  Current reading: ");
+          Serial.print(currentReading, 2);
+          Serial.print("V, Target: ");
+          Serial.print(targetVoltage, 2);
+          Serial.print("V");
+          Serial.print(", Calculated factor: ");
+          Serial.println(CALIBRATION_FACTOR, 4);
+          Serial.println("  Calibration saved to flash memory");
+        }
+      } else {
+        Serial.println("! AUTO-CALIBRATION FAILED: No valid voltage reading yet");
+      }
     }
   }
   
