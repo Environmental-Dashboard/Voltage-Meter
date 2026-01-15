@@ -6,7 +6,7 @@ Automatic battery protection system that disconnects your load when voltage gets
 
 View the complete wiring diagram here: [Cirkit Designer - Battery Monitor Wiring](https://app.cirkitdesigner.com/project/de4b9459-3ebd-45a3-887c-bb5d5f185a88)
 
-View the complete wiring documentation here: [Circuit Docs]()
+View the complete wiring documentation here: [Circuit Docs](https://github.com/Environmental-Dashboard/-Battery-Cutoff-Monitor/blob/main/CIRCUIT_DOCUMENTATION.md)
 
 ---
 
