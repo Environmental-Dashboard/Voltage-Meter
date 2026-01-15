@@ -647,6 +647,7 @@ void handleSettings() {
       changed = true;
       Serial.print("! CALIBRATION FACTOR CHANGED to: ");
       Serial.println(CALIBRATION_FACTOR, 4);
+      Serial.println("  Calibration formula: factor = measured_voltage / displayed_voltage");
     }
   }
   
