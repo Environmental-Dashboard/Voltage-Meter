@@ -635,39 +635,53 @@ void handleSettings() {
   // IMPORTANT: Re-evaluate load state immediately after threshold change
   // This ensures the system responds to new thresholds right away
   if (changed && autoMode) {
+    Serial.println("! THRESHOLD CHANGE DETECTED - Re-evaluating load state");
+    Serial.print("  New cutoff: ");
+    Serial.print(V_CUTOFF, 2);
+    Serial.print("V, New reconnect: ");
+    Serial.print(V_RECONNECT, 2);
+    Serial.print("V, Current voltage: ");
+    Serial.print(lastVBat, 2);
+    Serial.println("V");
+    
+    // Always check and apply the correct state based on new thresholds
     if (lastVBat <= V_CUTOFF) {
-      // Voltage at or below cutoff - turn OFF
+      // Voltage at or below cutoff - must be OFF
       if (loadEnabled) {
+        Serial.println("  -> Turning load OFF (voltage at or below cutoff)");
         applyLoadState(false);
-        Serial.print("! Threshold change: Load OFF (");
-        Serial.print(lastVBat, 2);
-        Serial.print("V <= cutoff ");
-        Serial.print(V_CUTOFF, 2);
-        Serial.println("V)");
+      } else {
+        Serial.println("  -> Load already OFF (voltage at or below cutoff)");
       }
     }
     else if (lastVBat >= V_RECONNECT) {
-      // Voltage at or above reconnect - turn ON
+      // Voltage at or above reconnect - must be ON
       if (!loadEnabled) {
+        Serial.println("  -> Turning load ON (voltage at or above reconnect)");
         applyLoadState(true);
-        Serial.print("! Threshold change: Load ON (");
-        Serial.print(lastVBat, 2);
-        Serial.print("V >= reconnect ");
-        Serial.print(V_RECONNECT, 2);
-        Serial.println("V)");
+      } else {
+        Serial.println("  -> Load already ON (voltage at or above reconnect)");
       }
     }
     else {
-      // Voltage is between thresholds - no change
-      Serial.print("! Threshold changed, voltage between limits (");
+      // Voltage is between thresholds - keep current state but log it
+      Serial.print("  -> Load stays ");
+      Serial.print(loadEnabled ? "ON" : "OFF");
+      Serial.print(" (voltage between thresholds: ");
       Serial.print(V_CUTOFF, 2);
       Serial.print("V < ");
       Serial.print(lastVBat, 2);
       Serial.print("V < ");
       Serial.print(V_RECONNECT, 2);
-      Serial.print("V), load stays ");
-      Serial.println(loadEnabled ? "ON" : "OFF");
+      Serial.println("V)");
     }
+    
+    // Force relay update to ensure hardware state matches
+    setRelayEnergized(loadEnabled);
+    Serial.print("  -> Relay pin ");
+    Serial.print(RELAY_PIN);
+    Serial.print(" set to ");
+    Serial.println(loadEnabled ? "LOW (energized)" : "HIGH (not energized)");
   }
   
   // Return current settings
