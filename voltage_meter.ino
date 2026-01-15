@@ -809,7 +809,7 @@ void loop() {
     lastVBat = smoothVoltage(rawVoltage);  // Ultra-stable display value
     
     // Automatic control (only if in auto mode)
-    // Two-threshold hysteresis logic
+    // Improved hysteresis logic: voltage > cutoff = ON, but use reconnect when recovering from OFF
     if (autoMode) {
       if (lastVBat <= V_CUTOFF) {
         // Voltage at or below cutoff - turn OFF
@@ -822,18 +822,24 @@ void loop() {
           applyLoadState(false);
         }
       }
-      else if (lastVBat >= V_RECONNECT) {
-        // Voltage at or above reconnect - turn ON
+      else if (lastVBat > V_CUTOFF) {
+        // Voltage is above cutoff
         if (!loadEnabled) {
-          Serial.print("! RECONNECT: Battery voltage (");
-          Serial.print(lastVBat, 2);
-          Serial.print("V) at or above reconnect (");
-          Serial.print(V_RECONNECT, 2);
-          Serial.println("V), turning load ON");
-          applyLoadState(true);
+          // Load is currently OFF - need to reach reconnect threshold to turn back ON
+          if (lastVBat >= V_RECONNECT) {
+            Serial.print("! RECONNECT: Battery voltage (");
+            Serial.print(lastVBat, 2);
+            Serial.print("V) at or above reconnect (");
+            Serial.print(V_RECONNECT, 2);
+            Serial.println("V), turning load ON");
+            applyLoadState(true);
+          }
+        }
+        else {
+          // Load is currently ON and voltage is above cutoff - keep it ON
+          // This ensures if voltage > cutoff, load stays ON
         }
       }
-      // If voltage is between cutoff and reconnect, load stays in current state
     }
     
     // Output CSV format to serial: voltage, load_state
