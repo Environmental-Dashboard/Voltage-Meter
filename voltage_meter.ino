@@ -447,16 +447,15 @@ String htmlPage() {
   s += "<span class='status' id='mode'>--</span>";
   s += "</div>";
   
-  // Thresholds
+  // Threshold
   s += "<div class='info'>";
-  s += "<span class='label'>Turn OFF at</span>";
+  s += "<span class='label'>Cutoff Threshold</span>";
   s += "<span class='value'><span class='threshold' id='lower'>--</span> V</span>";
   s += "</div>";
   
-  s += "<div class='info'>";
-  s += "<span class='label'>Turn ON at</span>";
-  s += "<span class='value'><span class='threshold' id='upper'>--</span> V</span>";
-  s += "</div>";
+  s += "<small style='text-align:center;color:#6c757d;margin:8px 0;display:block'>";
+  s += "Load ON when voltage > threshold, OFF when voltage ≤ threshold";
+  s += "</small>";
   
   // Control buttons
   s += "<div class='buttons'>";
@@ -489,9 +488,8 @@ String htmlPage() {
   s += "    modeElem.textContent = j.auto_mode ? 'AUTO' : 'MANUAL';";
   s += "    modeElem.className = 'status ' + (j.auto_mode ? 'status-auto' : 'status-manual');";
   
-  // Update thresholds
+  // Update threshold
   s += "    document.getElementById('lower').textContent = j.v_cutoff.toFixed(2);";
-  s += "    document.getElementById('upper').textContent = j.v_reconnect.toFixed(2);";
   
   s += "  }catch(e){console.error('Fetch error:',e);}";
   s += "}";
@@ -615,30 +613,30 @@ void handleSettings() {
   // IMPORTANT: Re-evaluate load state immediately after threshold change
   // This ensures the system responds to new thresholds right away
   if (changed && autoMode) {
-    if (lastVBat <= V_CUTOFF) {
-      // Voltage at or below cutoff - turn OFF
-      if (loadEnabled) {
-        applyLoadState(false);
-        Serial.println("! Threshold change triggered: Load turned OFF (voltage at or below cutoff)");
-      }
+    bool shouldBeOn = (lastVBat > V_CUTOFF);
+    
+    if (shouldBeOn && !loadEnabled) {
+      // Voltage is above new cutoff and load is OFF - turn it ON
+      applyLoadState(true);
+      Serial.print("! Threshold change triggered: Load turned ON (");
+      Serial.print(lastVBat, 2);
+      Serial.print("V > ");
+      Serial.print(V_CUTOFF, 2);
+      Serial.println("V)");
     }
-    else if (lastVBat >= V_RECONNECT) {
-      // Voltage at or above reconnect - turn ON
-      if (!loadEnabled) {
-        applyLoadState(true);
-        Serial.println("! Threshold change triggered: Load turned ON (voltage at or above reconnect)");
-      }
+    else if (!shouldBeOn && loadEnabled) {
+      // Voltage is at or below new cutoff and load is ON - turn it OFF
+      applyLoadState(false);
+      Serial.print("! Threshold change triggered: Load turned OFF (");
+      Serial.print(lastVBat, 2);
+      Serial.print("V <= ");
+      Serial.print(V_CUTOFF, 2);
+      Serial.println("V)");
     }
-    // If voltage is between thresholds, check which action makes sense
-    else if (loadEnabled && lastVBat < V_RECONNECT) {
-      // Load is ON but voltage dropped below reconnect (though above cutoff)
-      // Keep it ON - only turn OFF at cutoff
-      Serial.println("! Threshold change: Load stays ON (voltage between thresholds)");
-    }
-    else if (!loadEnabled && lastVBat > V_CUTOFF) {
-      // Load is OFF but voltage is above cutoff (though below reconnect)  
-      // Keep it OFF - only turn ON at reconnect
-      Serial.println("! Threshold change: Load stays OFF (voltage between thresholds)");
+    else {
+      // No change needed
+      Serial.print("! Threshold changed but load stays ");
+      Serial.println(loadEnabled ? "ON" : "OFF");
     }
   }
   
@@ -767,23 +765,28 @@ void loop() {
     lastVBat = smoothVoltage(rawVoltage);  // Ultra-stable display value
     
     // Automatic control (only if in auto mode)
-    // Hysteresis logic: cutoff (lower) and reconnect (upper) thresholds
+    // Simple logic: compare voltage to cutoff threshold
     if (autoMode) {
-      if (lastVBat <= V_CUTOFF) {
-        // Voltage at or below cutoff - turn OFF
-        if (loadEnabled) {
-          Serial.println("! CUTOFF: Battery voltage at or below cutoff, turning load OFF");
-          applyLoadState(false);
-        }
+      bool shouldBeOn = (lastVBat > V_CUTOFF);
+      
+      if (shouldBeOn && !loadEnabled) {
+        // Voltage is above cutoff and load is OFF - turn it ON
+        Serial.print("! RECONNECT: Battery voltage (");
+        Serial.print(lastVBat, 2);
+        Serial.print("V) above cutoff (");
+        Serial.print(V_CUTOFF, 2);
+        Serial.println("V), turning load ON");
+        applyLoadState(true);
       }
-      else if (lastVBat >= V_RECONNECT) {
-        // Voltage at or above reconnect - turn ON
-        if (!loadEnabled) {
-          Serial.println("! RECONNECT: Battery voltage at or above reconnect, turning load ON");
-          applyLoadState(true);
-        }
+      else if (!shouldBeOn && loadEnabled) {
+        // Voltage is at or below cutoff and load is ON - turn it OFF
+        Serial.print("! CUTOFF: Battery voltage (");
+        Serial.print(lastVBat, 2);
+        Serial.print("V) at or below cutoff (");
+        Serial.print(V_CUTOFF, 2);
+        Serial.println("V), turning load OFF");
+        applyLoadState(false);
       }
-      // Note: If voltage is between cutoff and reconnect, load stays in current state
     }
     
     // Output CSV format to serial: voltage, load_state
