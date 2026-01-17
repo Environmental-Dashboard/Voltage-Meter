@@ -35,6 +35,7 @@ Monitors your battery voltage continuously. Uses two thresholds to protect your 
 | Capacitor | 0.1µF to 1µF ceramic |
 | Battery | 8V-16V (tested with 12.8V LiFePO4) |
 | Wires | Jumper wires and power wires |
+| Slide switch (optional) | SPST for battery disconnect during programming |
 
 ---
 
@@ -78,6 +79,20 @@ ESP32 GND ──→ Relay GND
 5V power supply ──→ ESP32 VIN
 GND ──→ ESP32 GND
 ```
+
+### E. Battery Programming Switch (Recommended)
+
+To allow code uploads while the battery is connected, add a switch in the battery positive line:
+
+```
+Battery + ──→ [SPST Switch] ──→ Rest of circuit
+```
+
+**Switch positions:**
+- **OFF:** Disconnects battery power, allows USB programming
+- **ON:** Normal operation with battery power
+
+This prevents power conflicts between USB and battery that can interfere with serial communication during uploads.
 
 ### IMPORTANT: Common Ground
 
@@ -415,6 +430,37 @@ date -r $((TIMESTAMP / 1000))
 
 ## Troubleshooting
 
+### Can't Upload Code When Battery Is Connected
+
+**Problem:** Computer doesn't recognize USB port when battery is connected
+
+**Why this happens:** When battery power is connected, it can interfere with the USB-serial chip's ability to communicate with your computer. This is a hardware-level conflict that occurs before any code runs.
+
+**Solution: Add a battery disconnect switch**
+
+Install a simple SPST (Single Pole Single Throw) slide switch in the battery positive line:
+
+```
+Battery + ──→ [SPST Switch] ──→ Circuit
+```
+
+**To upload new code:**
+1. Turn the switch OFF (disconnects battery)
+2. Connect USB cable
+3. Upload code normally
+4. Disconnect USB (optional)
+5. Turn the switch ON (reconnects battery)
+
+**Recommended switches:**
+- Mini slide switch (breadboard-friendly)
+- Toggle switch (panel mount for enclosures)
+- JST connector (for quick disconnect without a switch)
+
+**Alternative solutions:**
+- Use a JST connector on the battery wire for quick disconnect
+- Add a Schottky diode (1N5817) in series with battery positive for isolation (loses ~0.3V)
+- For permanent installations, design a proper power path management circuit
+
 ### Wrong Voltage Reading
 
 **Problem:** Displayed voltage doesn't match multimeter
@@ -504,6 +550,7 @@ const float RBOT = 10000.0;   // Change to your measured value
 **Problem:** Upload fails with serial errors
 
 **Fix:**
+- If battery is connected, disconnect it or turn off the battery switch (see above)
 - Close Serial Monitor before uploading
 - Try different USB cable
 - Use /dev/tty.usbserial-* port instead of /dev/cu.*
@@ -583,6 +630,7 @@ This is well below the 3.3V maximum for ESP32 ADC. Safe operation confirmed.
 6. Calibrate ADC before relying on voltage readings
 7. Never short circuit battery terminals
 8. Double-check wiring before powering on
+9. Use battery disconnect switch when programming to avoid USB conflicts
 
 ---
 
