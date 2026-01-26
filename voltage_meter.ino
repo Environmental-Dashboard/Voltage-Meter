@@ -118,12 +118,30 @@
  * 
  * FEATURES:
  * - Measures battery voltage via voltage divider into ADC1 pin (GPIO36/VP)
- * - Controls NO relay to disconnect load at low voltage
+ * - Controls relay to disconnect load at low voltage
  * - Simple logic: voltage above reconnect = ON, voltage below cutoff = OFF
  * - Web interface with live updates
  * - JSON API endpoint for external monitoring
  * - Dynamic threshold adjustment via web API
  * - Serial output for debugging (CSV format)
+ * 
+ * NEW FEATURES ADDED (Day/Night profiles + UTF-8):
+ * - Uses NTP time to select Day vs Night cutoff/reconnect thresholds automatically
+ * - Day and Night thresholds are independently adjustable via existing /settings endpoint
+ * - Web UI retained, plus UTF-8 charset enabled for correct emoji rendering
+ * 
+ * CALIBRATION FIX (NEW CHANGE YOU REQUESTED):
+ * - Adds readBatteryVoltageRaw() (uncalibrated / unsmoothed)
+ * - /settings?target=... now calibrates using RAW averaged readings (reliable)
+ * 
+ * NEW POWER-SAVING FEATURE (THIS UPDATE):
+ * - ESP32 wakes periodically (e.g., every 10 minutes), connects to WiFi, runs the web server
+ *   for a short awake window (e.g., 60 seconds), then deep-sleeps to save power.
+ * - Relay state is applied before sleeping and the relay GPIO is held during deep sleep.
+ * 
+ * IMPORTANT TRADEOFF:
+ * - While the ESP32 is in deep sleep, the web UI will NOT be reachable.
+ * - Battery/relay decisions are evaluated on wake (so switching resolution is the wake interval).
  * 
  * ============================================================================
  */
@@ -131,6 +149,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>  // For persistent storage (replaces EEPROM on ESP32)
+#include <time.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 
 // ============================================================================
 // CONFIGURATION SECTION - MODIFY THESE VALUES FOR YOUR SETUP
@@ -143,7 +164,7 @@ const char* WIFI_PASS = "122ElmStreet";
 
 // Pin Assignments
 const int ADC_PIN = 36;      // GPIO36 (VP) - ADC1_CH0, works with WiFi enabled
-const int RELAY_PIN = 27;    // GPIO27 (D27) - Controls relay module
+const int RELAY_PIN = 2;    // GPIO27 (D2) - Controls relay module
 
 // Relay Configuration
 // Most relay modules are "active LOW" - setting pin LOW energizes the coil
@@ -176,6 +197,32 @@ const int ADC_MAX = 4095;     // 12-bit ADC resolution (0-4095)
 float CALIBRATION_FACTOR = 1.0;  // Calibration factor (1.0 = no calibration, adjust as needed)
 Preferences preferences;  // For saving calibration to flash memory
 const int SAMPLES = 200;      // Number of samples to average for stable reading (increased for maximum stability)
+
+// ============================================================================
+// POWER SAVING (NEW FEATURE)
+// ============================================================================
+//
+// Wake up every WAKE_INTERVAL_MINUTES, connect to WiFi, serve UI for AWAKE_WINDOW_SECONDS,
+// then go to deep sleep.
+//
+// NOTE: While sleeping, the web UI is offline.
+// NOTE: Relay decisions are evaluated once per wake cycle.
+//
+const uint32_t WAKE_INTERVAL_MINUTES = 10;  // example: every 10 minutes
+const uint32_t AWAKE_WINDOW_SECONDS  = 60;  // example: stay awake 60 seconds
+
+// ============================================================================
+// DAY / NIGHT PROFILE SETTINGS
+// ============================================================================
+
+const int NIGHT_START_HOUR = 22; // 10 PM
+const int DAY_START_HOUR   = 8;  // 8 AM
+
+float NIGHT_CUTOFF    = 11.5;
+float NIGHT_RECONNECT = 12.5;
+
+float DAY_CUTOFF      = 12.0;
+float DAY_RECONNECT   = 12.6;
 
 // ============================================================================
 // BATTERY PROTECTION THRESHOLDS - CUSTOMIZE THESE FOR YOUR NEEDS
@@ -237,9 +284,10 @@ const int SAMPLES = 200;      // Number of samples to average for stable reading
 //
 // ============================================================================
 
-// Thresholds are changeable via web interface
+// Backward-compatible "active profile" thresholds (used by old UI/JSON keys)
+// These are automatically set based on day/night profile
 float V_CUTOFF = 12.0;           // Disconnect load at or below this voltage (changeable)
-float V_RECONNECT = 12.9;        // Reconnect load at or above this voltage (changeable)
+float V_RECONNECT = 12.6;        // Reconnect load at or above this voltage (changeable)
 
 // ============================================================================
 
@@ -266,9 +314,44 @@ const unsigned long FORTY_EIGHT_HOURS_MS = 48UL * 60UL * 60UL * 1000UL; // 48 ho
 
 // Moving average for ultra-stable voltage display
 const int DISPLAY_SAMPLES = 30;  // Increased for maximum stability (30 samples = 7.5 seconds of history)
-float voltageHistory[30] = {0};
+float voltageHistory[DISPLAY_SAMPLES] = {0};
 int voltageIndex = 0;
 bool historyInitialized = false;  // Track if buffer is filled
+
+// Track awake window
+unsigned long bootMillis = 0;
+
+// ============================================================================
+// DAY / NIGHT TIME HELPERS
+// ============================================================================
+
+/**
+ * Determines if current time is night based on NIGHT_START_HOUR and DAY_START_HOUR
+ * 
+ * @return true if it's night time, false if day time (or if time not available)
+ */
+bool isNightTime() {
+  struct tm t;
+  if (!getLocalTime(&t)) return false; // If time not available, treat as day
+  return (t.tm_hour >= NIGHT_START_HOUR || t.tm_hour < DAY_START_HOUR);
+}
+
+/**
+ * Refreshes the active thresholds (V_CUTOFF, V_RECONNECT) based on current day/night profile
+ * Enforces minimum hysteresis gap of 0.3V
+ */
+void refreshActiveThresholds() {
+  bool night = isNightTime();
+
+  float cutoff    = night ? NIGHT_CUTOFF    : DAY_CUTOFF;
+  float reconnect = night ? NIGHT_RECONNECT : DAY_RECONNECT;
+
+  // Enforce minimum hysteresis gap
+  if (reconnect < cutoff + 0.3f) reconnect = cutoff + 0.3f;
+
+  V_CUTOFF = cutoff;
+  V_RECONNECT = reconnect;
+}
 
 // ============================================================================
 // RELAY CONTROL FUNCTIONS
@@ -332,6 +415,23 @@ void applyLoadState(bool wantLoadOn) {
   loadEnabled = wantLoadOn;
   // NO relay logic: To enable load, relay must be energized
   setRelayEnergized(wantLoadOn);
+}
+
+/**
+ * Holds the relay GPIO state during deep sleep so the relay does not glitch.
+ * GPIO27 is RTC-capable on ESP32, so RTC hold can be used 
+ */
+void holdRelayPinDuringSleep() {
+  // Ensure the pin is RTC capable before using rtc_gpio_* (GPIO27 is RTC-capable)
+  rtc_gpio_hold_dis((gpio_num_t)RELAY_PIN);          // disable hold while updating
+  rtc_gpio_set_direction((gpio_num_t)RELAY_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
+
+  // Read current digital level and hold it
+  int level = digitalRead(RELAY_PIN);
+  rtc_gpio_set_level((gpio_num_t)RELAY_PIN, level);
+
+  rtc_gpio_hold_en((gpio_num_t)RELAY_PIN);           // enable hold for the pin
+  gpio_deep_sleep_hold_en();                         // enable deep-sleep hold globally
 }
 
 /**
@@ -438,6 +538,38 @@ float readBatteryVoltage() {
   return vBat;
 }
 
+// ===========================
+// NEW: RAW reading (NO calibration, NO smoothing) for target calibration
+// ===========================
+/**
+ * Reads battery voltage without applying calibration factor or smoothing
+ * Used for calibration purposes where we need the raw, uncalibrated reading
+ * 
+ * @return Raw battery voltage (uncalibrated, unsmoothed)
+ */
+float readBatteryVoltageRaw() {
+  float samples[SAMPLES];
+
+  for (int i = 0; i < SAMPLES; i++) {
+    samples[i] = (float)analogRead(ADC_PIN);
+    delayMicroseconds(500);
+  }
+
+  sortArray(samples, SAMPLES);
+
+  int discard = SAMPLES / 10;
+  long sum = 0;
+  for (int i = discard; i < SAMPLES - discard; i++) {
+    sum += (long)samples[i];
+  }
+
+  float avgADC = (float)sum / (float)(SAMPLES - 2 * discard);
+  float vAdc = (avgADC / (float)ADC_MAX) * VREF;
+
+  // IMPORTANT: no calibration factor here
+  return vAdc * ((RTOP + RBOT) / RBOT);
+}
+
 // ============================================================================
 // BATTERY PERCENTAGE ESTIMATION
 // ============================================================================
@@ -498,7 +630,9 @@ String htmlPage() {
   String s;
   
   // HTML head with responsive viewport and styling
-  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  s += "<!doctype html><html><head>";
+  s += "<meta charset='UTF-8'>";
+  s += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   s += "<title>Battery Monitor</title>";
   
   // Embedded CSS for clean, simple design
@@ -542,6 +676,7 @@ String htmlPage() {
   s += "<span class='label'>Control Mode</span>";
   s += "<span class='status' id='mode'>--</span>";
   s += "</div>";
+  s += "<div class='info'><span class='label'>Profile</span><span class='status' id='profile'>--</span></div>";
   
   // Thresholds
   s += "<div class='info'>";
@@ -553,6 +688,9 @@ String htmlPage() {
   s += "<span class='label'>Turn ON at</span>";
   s += "<span class='value'><span class='threshold' id='upper'>--</span> V</span>";
   s += "</div>";
+
+  s += "<div class='info'><span class='label'>Day OFF / ON</span><span class='value'><span class='threshold' id='day_lower'>--</span> / <span class='threshold' id='day_upper'>--</span> V</span></div>";
+  s += "<div class='info'><span class='label'>Night OFF / ON</span><span class='value'><span class='threshold' id='night_lower'>--</span> / <span class='threshold' id='night_upper'>--</span> V</span></div>";
   
   s += "<small style='text-align:center;color:#6c757d;margin:8px 0;display:block'>";
   s += "Hysteresis: OFF at ≤ lower, ON at ≥ upper, between = no change";
@@ -566,7 +704,7 @@ String htmlPage() {
   s += "</div>";
   
   // Footer
-  s += "<small>" + ip + " • Updates every second</small>";
+  s += "<small>" + ip + " • Updates every second (while awake)</small>";
   s += "</div>";
   
   // JavaScript for live updates
@@ -588,10 +726,19 @@ String htmlPage() {
   s += "    const modeElem = document.getElementById('mode');";
   s += "    modeElem.textContent = j.auto_mode ? 'AUTO' : 'MANUAL';";
   s += "    modeElem.className = 'status ' + (j.auto_mode ? 'status-auto' : 'status-manual');";
+
+  s += "    const profileElem = document.getElementById('profile');";
+  s += "    profileElem.textContent = j.night ? '🌙 Night' : '☀️ Day';";
+  s += "    profileElem.className = 'status ' + (j.night ? 'status-manual' : 'status-auto');";
   
   // Update thresholds
   s += "    document.getElementById('lower').textContent = j.v_cutoff.toFixed(2);";
   s += "    document.getElementById('upper').textContent = j.v_reconnect.toFixed(2);";
+
+  s += "    document.getElementById('day_lower').textContent = Number(j.day_cutoff).toFixed(2);";
+  s += "    document.getElementById('day_upper').textContent = Number(j.day_reconnect).toFixed(2);";
+  s += "    document.getElementById('night_lower').textContent = Number(j.night_cutoff).toFixed(2);";
+  s += "    document.getElementById('night_upper').textContent = Number(j.night_reconnect).toFixed(2);";
   
   s += "  }catch(e){console.error('Fetch error:',e);}";
   s += "}";
@@ -611,7 +758,7 @@ String htmlPage() {
  * Serves the HTML web interface
  */
 void handleRoot() {
-  server.send(200, "text/html", htmlPage());
+  server.send(200, "text/html; charset=UTF-8", htmlPage());
 }
 
 /**
@@ -629,6 +776,9 @@ void handleRoot() {
  * }
  */
 void handleStatus() {
+  refreshActiveThresholds();
+  bool night = isNightTime();
+
   // Calculate turn-ON count in last 48 hours
   unsigned long currentTime = millis();
   unsigned long fortyEightHoursAgo = currentTime - FORTY_EIGHT_HOURS_MS;
@@ -646,8 +796,13 @@ void handleStatus() {
   json += "\"voltage_v\":" + String(lastVBat, 3) + ",";
   json += "\"load_on\":" + String(loadEnabled ? "true" : "false") + ",";
   json += "\"auto_mode\":" + String(autoMode ? "true" : "false") + ",";
+  json += "\"night\":" + String(night ? "true" : "false") + ",";
   json += "\"v_cutoff\":" + String(V_CUTOFF, 2) + ",";
   json += "\"v_reconnect\":" + String(V_RECONNECT, 2) + ",";
+  json += "\"day_cutoff\":" + String(DAY_CUTOFF, 2) + ",";
+  json += "\"day_reconnect\":" + String(DAY_RECONNECT, 2) + ",";
+  json += "\"night_cutoff\":" + String(NIGHT_CUTOFF, 2) + ",";
+  json += "\"night_reconnect\":" + String(NIGHT_RECONNECT, 2) + ",";
   json += "\"calibration_factor\":" + String(CALIBRATION_FACTOR, 4) + ",";
   json += "\"cycle_count\":" + String(cycleCount) + ",";
   json += "\"turn_on_count_48h\":" + String(turnOnCount48h) + ",";
@@ -707,20 +862,29 @@ void handleRelay() {
  */
 void handleSettings() {
   bool changed = false;
-  
-  // Accept threshold changes - can set one or both
+
+  refreshActiveThresholds();
+
+  // Threshold updates apply to ACTIVE profile (day vs night)
   if (server.hasArg("lower")) {
     float newValue = server.arg("lower").toFloat();
-    if (newValue > 8.0 && newValue < 15.0) {  // Safety limits
-      V_CUTOFF = newValue;
+    if (newValue > 8.0f && newValue < 15.0f) {
+      if (isNightTime()) NIGHT_CUTOFF = newValue;
+      else DAY_CUTOFF = newValue;
       changed = true;
     }
   }
-  
+
   if (server.hasArg("upper")) {
     float newValue = server.arg("upper").toFloat();
-    if (newValue > 8.0 && newValue < 15.0) {  // Safety limits
-      V_RECONNECT = newValue;
+    if (newValue > 8.0f && newValue < 15.0f) {
+      if (isNightTime()) {
+        if (newValue < NIGHT_CUTOFF + 0.3f) newValue = NIGHT_CUTOFF + 0.3f;
+        NIGHT_RECONNECT = newValue;
+      } else {
+        if (newValue < DAY_CUTOFF + 0.3f) newValue = DAY_CUTOFF + 0.3f;
+        DAY_RECONNECT = newValue;
+      }
       changed = true;
     }
   }
@@ -745,101 +909,69 @@ void handleSettings() {
     }
   }
   
-  // Method 2: Auto-calibration with target voltage (calculates factor automatically)
-  // Usage: /settings?target=13.5
-  // This automatically calculates and sets the calibration factor
+  // ===========================
+  // FIXED Target calibration (uses RAW averaged readings)
+  // ===========================
   if (server.hasArg("target")) {
     float targetVoltage = server.arg("target").toFloat();
-    if (targetVoltage > 8.0 && targetVoltage < 20.0) {  // Reasonable voltage range
-      // Get current reading (with current calibration)
-      float currentReading = lastVBat;
-      
-      if (currentReading > 0.1) {  // Make sure we have a valid reading
-        // Calculate what the calibration factor should be
-        // If current reading is with factor X, and we want target:
-        // target = raw * new_factor
-        // current = raw * old_factor
-        // So: new_factor = old_factor * (target / current)
-        float newFactor = CALIBRATION_FACTOR * (targetVoltage / currentReading);
-        
-        if (newFactor > 0.5 && newFactor < 2.0) {
+
+    if (targetVoltage > 8.0f && targetVoltage < 20.0f) {
+      bool prevAuto = autoMode;
+      bool prevLoad = loadEnabled;
+      autoMode = false;
+
+      Serial.println("! AUTO-CALIBRATION START");
+      Serial.print("  Target voltage: ");
+      Serial.println(targetVoltage, 3);
+
+      delay(300);
+
+      const int CAL_SAMPLES = 60; // ~2 seconds
+      float sum = 0.0f;
+      for (int i = 0; i < CAL_SAMPLES; i++) {
+        sum += readBatteryVoltageRaw();   // <-- uncalibrated, unsmoothed
+        delay(30);
+      }
+
+      float measuredRaw = sum / (float)CAL_SAMPLES;
+
+      Serial.print("  Measured RAW avg: ");
+      Serial.println(measuredRaw, 3);
+
+      if (measuredRaw > 0.1f) {
+        float newFactor = targetVoltage / measuredRaw;
+
+        if (newFactor > 0.5f && newFactor < 2.0f) {
           CALIBRATION_FACTOR = newFactor;
           changed = true;
-          
-          // Save to flash memory
+
           preferences.begin("voltmeter", false);
           preferences.putFloat("cal_factor", CALIBRATION_FACTOR);
           preferences.end();
-          
-          Serial.print("! AUTO-CALIBRATION:");
-          Serial.print("  Current reading: ");
-          Serial.print(currentReading, 2);
-          Serial.print("V, Target: ");
-          Serial.print(targetVoltage, 2);
-          Serial.print("V");
-          Serial.print(", Calculated factor: ");
-          Serial.println(CALIBRATION_FACTOR, 4);
+
+          Serial.print("  -> New calibration factor: ");
+          Serial.println(CALIBRATION_FACTOR, 5);
           Serial.println("  Calibration saved to flash memory");
+        } else {
+          Serial.println("! AUTO-CALIBRATION FAILED: factor out of range (0.5 to 2.0)");
         }
       } else {
-        Serial.println("! AUTO-CALIBRATION FAILED: No valid voltage reading yet");
+        Serial.println("! AUTO-CALIBRATION FAILED: raw reading invalid/too small");
       }
+
+      autoMode = prevAuto;
+      applyLoadState(prevLoad);
+
+      Serial.println("! AUTO-CALIBRATION END");
     }
   }
+
+  refreshActiveThresholds();
   
-  // Validate that upper >= lower (can be equal for no hysteresis)
-  if (V_RECONNECT < V_CUTOFF) {
-    V_RECONNECT = V_CUTOFF;  // Force upper to at least equal lower
-  }
-  
-  // IMPORTANT: Re-evaluate load state immediately after threshold change
-  // This ensures the system responds to new thresholds right away
+  // Immediate re-evaluation if thresholds changed and autoMode is on
   if (changed && autoMode) {
-    Serial.println("! THRESHOLD CHANGE DETECTED - Re-evaluating load state");
-    Serial.print("  New cutoff: ");
-    Serial.print(V_CUTOFF, 2);
-    Serial.print("V, New reconnect: ");
-    Serial.print(V_RECONNECT, 2);
-    Serial.print("V, Current voltage: ");
-    Serial.print(lastVBat, 2);
-    Serial.println("V");
-    
-    // Always check and apply the correct state based on new thresholds
-    // When thresholds change:
-    // - If voltage <= new lower → OFF
-    // - If voltage > new lower → ON (immediately, ignore upper when threshold changes)
-    // - If voltage >= new upper → ON
-    if (lastVBat <= V_CUTOFF) {
-      // Voltage at or below new lower threshold - must be OFF
-      if (loadEnabled) {
-        Serial.println("  -> Turning load OFF (voltage at or below new lower threshold)");
-        applyLoadState(false);
-      } else {
-        Serial.println("  -> Load already OFF (voltage at or below new lower threshold)");
-      }
-    }
-    else if (lastVBat > V_CUTOFF) {
-      // Voltage is above new lower threshold - turn ON immediately
-      // This allows changing lower threshold below current voltage to turn load ON
-      if (!loadEnabled) {
-        Serial.print("  -> Turning load ON (voltage ");
-        Serial.print(lastVBat, 2);
-        Serial.print("V > new lower ");
-        Serial.print(V_CUTOFF, 2);
-        Serial.println("V)");
-        applyLoadState(true);
-      }
-      else {
-        Serial.println("  -> Load stays ON (voltage above new lower threshold)");
-      }
-    }
-    
-    // Force relay update to ensure hardware state matches
-    setRelayEnergized(loadEnabled);
-    Serial.print("  -> Relay pin ");
-    Serial.print(RELAY_PIN);
-    Serial.print(" set to ");
-    Serial.println(loadEnabled ? "LOW (energized)" : "HIGH (not energized)");
+    if (lastVBat <= V_CUTOFF) applyLoadState(false);
+    else applyLoadState(true);
   }
   
   // Return current settings
@@ -851,17 +983,97 @@ void handleSettings() {
   json += "}";
   
   server.send(200, "application/json", json);
-  
-  if (changed) {
-    Serial.println("! SETTINGS CHANGED:");
-    Serial.print("  Cutoff: ");
-    Serial.print(V_CUTOFF, 2);
-    Serial.print("V, Reconnect: ");
-    Serial.print(V_RECONNECT, 2);
-    Serial.print("V, Current voltage: ");
-    Serial.print(lastVBat, 2);
-    Serial.println("V");
+}
+
+// ============================================================================
+// POWER SAVING HELPERS (NEW FEATURE)
+// ============================================================================
+
+/**
+ * Connects to WiFi (best-effort) with a short timeout.
+ * This is called at each wake-up to enable the web server during the awake window.
+ */
+void connectWiFiBestEffort() {
+  WiFi.setTxPower(WIFI_POWER_11dBm);  // keep your low-noise setting
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    delay(250);
+    Serial.print(".");
   }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection failed (timeout)");
+    Serial.println("System will continue without WiFi");
+  }
+}
+
+/**
+ * Syncs NTP time (best-effort). If WiFi is not connected, time may not update.
+ */
+void syncTimeBestEffort() {
+  // Use US Eastern time rules.
+  setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  // Best-effort wait a little for NTP on first wake (do not block too long)
+  struct tm t;
+  for (int i = 0; i < 10; i++) {
+    if (getLocalTime(&t)) {
+      Serial.print("Time synced: ");
+      Serial.print(1900 + t.tm_year);
+      Serial.print("-");
+      Serial.print(1 + t.tm_mon);
+      Serial.print("-");
+      Serial.print(t.tm_mday);
+      Serial.print(" ");
+      Serial.print(t.tm_hour);
+      Serial.print(":");
+      Serial.println(t.tm_min);
+      return;
+    }
+    delay(200);
+  }
+  Serial.println("Time not available yet (using DAY profile until time is available).");
+}
+
+/**
+ * Prepares deep sleep and enters it.
+ * - Applies relay hold so relay does not glitch.
+ * - Turns off WiFi to save power.
+ * - Sleeps for WAKE_INTERVAL_MINUTES.
+ */
+void goToDeepSleep() {
+  Serial.println("Preparing for deep sleep...");
+
+  // Hold relay output level during deep sleep
+  holdRelayPinDuringSleep();
+
+  // Turn off WiFi to reduce current draw before sleeping
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Stop web server (not strictly required; deep sleep resets anyway)
+  server.stop();
+
+  // Set timer wakeup
+  uint64_t us = (uint64_t)WAKE_INTERVAL_MINUTES * 60ULL * 1000000ULL;
+  esp_sleep_enable_timer_wakeup(us);
+
+  Serial.print("Sleeping for ");
+  Serial.print(WAKE_INTERVAL_MINUTES);
+  Serial.println(" minutes...");
+
+  Serial.flush();
+  esp_deep_sleep_start();
 }
 
 // ============================================================================
@@ -872,6 +1084,8 @@ void setup() {
   // Initialize serial communication for debugging
   Serial.begin(115200);
   delay(300);  // Allow serial to stabilize
+
+  bootMillis = millis();
   
   Serial.println();
   Serial.println("========================================");
@@ -880,14 +1094,8 @@ void setup() {
   
   // Load saved calibration factor from flash memory
   preferences.begin("voltmeter", false);  // false = read/write mode
-  float savedCal = preferences.getFloat("cal_factor", 1.0);  // Default to 1.0 if not found
-  if (savedCal != 1.0) {
-    CALIBRATION_FACTOR = savedCal;
-    Serial.print("Loaded saved calibration factor: ");
-    Serial.println(CALIBRATION_FACTOR, 4);
-  } else {
-    Serial.println("No saved calibration found, using default: 1.0");
-  }
+  CALIBRATION_FACTOR = preferences.getFloat("cal_factor", 1.0);
+  preferences.end();
   
   // Configure relay pin as output
   pinMode(RELAY_PIN, OUTPUT);
@@ -896,15 +1104,6 @@ void setup() {
   analogReadResolution(12);                     // 12-bit resolution (0-4095)
   analogSetPinAttenuation(ADC_PIN, ADC_11db);  // 11dB attenuation (0-~3.3V, non-linear)
   
-  // Reduce WiFi TX power to minimize interference with ADC readings
-  // Lower power = less noise on power rail = more stable ADC
-  WiFi.setTxPower(WIFI_POWER_11dBm);  // Reduce from default 19.5dBm to minimize interference
-  
-  Serial.println("ADC configured: 12-bit, 11dB attenuation");
-  
-  // Initialize system in automatic mode with load enabled
-  autoMode = true;
-  
   // Initialize history array
   for (int i = 0; i < 288; i++) {
     turnOnHistory[i] = 0;
@@ -912,53 +1111,32 @@ void setup() {
   historyIndex = 0;
   historyCount = 0;
   
-  // Set initial state without counting as a cycle
+  // Start with load ON (state will be evaluated below)
   loadEnabled = true;
   setRelayEnergized(true);
   lastSwitchTime = millis();
   
-  Serial.println("Initial state: Load ON, Auto mode");
-  Serial.print("Voltage divider: ");
-  Serial.print(RTOP);
-  Serial.print("Ω / ");
-  Serial.print(RBOT);
-  Serial.print("Ω (ratio: ");
-  Serial.print((RTOP + RBOT) / RBOT, 2);
-  Serial.println(")");
-  
-  Serial.print("Cutoff: ");
-  Serial.print(V_CUTOFF);
-  Serial.print("V, Reconnect: ");
-  Serial.print(V_RECONNECT);
-  Serial.print("V, Calibration: ");
-  Serial.print(CALIBRATION_FACTOR, 4);
-  Serial.println(" (1.0 = no calibration)");
-  
-  // Connect to WiFi
-  Serial.println();
+  // Connect WiFi periodically (we are awake now)
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
+  connectWiFiBestEffort();
   
-  WiFi.mode(WIFI_STA);  // Station mode (client)
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Time config (best-effort each wake)
+  syncTimeBestEffort();
   
-  // Wait up to 15 seconds for connection
-  unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
-    delay(250);
-    Serial.print(".");
-  }
-  
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Open in browser: http://");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi connection failed (timeout)");
-    Serial.println("System will continue without WiFi");
+  // Read voltage ONCE immediately on boot/wake, set thresholds, and apply relay logic.
+  // This ensures relay is correct even if the user never opens the web UI.
+  float rawVoltage = readBatteryVoltage();
+  lastVBat = smoothVoltage(rawVoltage);
+
+  refreshActiveThresholds();
+
+  if (autoMode) {
+    if (lastVBat <= V_CUTOFF) {
+      applyLoadState(false);
+    } else if (lastVBat >= V_RECONNECT) {
+      applyLoadState(true);
+    }
   }
   
   // Configure web server routes
@@ -972,7 +1150,7 @@ void setup() {
   Serial.println("Web server started");
   Serial.println("========================================");
   Serial.println();
-  Serial.println("CSV Output: Voltage,Percent,LoadState");
+  Serial.println("CSV Output: Voltage,LoadState");
   Serial.println();
 }
 
@@ -981,56 +1159,35 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  // Handle incoming web requests
+  // Handle incoming web requests while awake
   server.handleClient();
-  
-  // Perform periodic voltage measurement and control logic
+
+  // Keep your original periodic measurement while awake
   static unsigned long lastReadTime = 0;
-  
-  // Update every 250ms (4 times per second)
   if (millis() - lastReadTime >= 250) {
     lastReadTime = millis();
-    
-    // Read battery voltage with smoothing
+
     float rawVoltage = readBatteryVoltage();
-    lastVBat = smoothVoltage(rawVoltage);  // Ultra-stable display value
-    
-    // Automatic control (only if in auto mode)
-    // Logic:
-    // - Voltage <= lower (cutoff) → Load OFF
-    // - Voltage >= upper (reconnect) → Load ON
-    // - Voltage between lower and upper → Stay in current state (hysteresis)
+    lastVBat = smoothVoltage(rawVoltage);
+
+    refreshActiveThresholds();
+
     if (autoMode) {
       if (lastVBat <= V_CUTOFF) {
-        // Voltage at or below lower threshold - turn OFF
-        if (loadEnabled) {
-          Serial.print("! CUTOFF: Battery voltage (");
-          Serial.print(lastVBat, 2);
-          Serial.print("V) at or below lower (");
-          Serial.print(V_CUTOFF, 2);
-          Serial.println("V), turning load OFF");
-          applyLoadState(false);
-        }
+        if (loadEnabled) applyLoadState(false);
+      } else if (lastVBat >= V_RECONNECT) {
+        if (!loadEnabled) applyLoadState(true);
       }
-      else if (lastVBat >= V_RECONNECT) {
-        // Voltage at or above upper threshold - turn ON
-        if (!loadEnabled) {
-          Serial.print("! RECONNECT: Battery voltage (");
-          Serial.print(lastVBat, 2);
-          Serial.print("V) at or above upper (");
-          Serial.print(V_RECONNECT, 2);
-          Serial.println("V), turning load ON");
-          applyLoadState(true);
-        }
-      }
-      // If voltage is between lower and upper, load stays in current state (hysteresis)
     }
-    
-    // Output CSV format to serial: voltage, load_state
-    // This format is easy to parse and log externally
+
     Serial.print(lastVBat, 2);
     Serial.print(",");
     Serial.println(loadEnabled ? 1 : 0);
+  }
+
+  // After the awake window expires, go to deep sleep to save power
+  if (millis() - bootMillis >= (AWAKE_WINDOW_SECONDS * 1000UL)) {
+    goToDeepSleep();
   }
 }
 
