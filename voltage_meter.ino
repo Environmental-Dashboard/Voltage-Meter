@@ -159,8 +159,8 @@
  
  // WiFi Credentials
  // Replace with your WiFi network name and password
- const char* WIFI_SSID = "ObieConnect";
- const char* WIFI_PASS = "122ElmStreet";
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
  
  // Pin Assignments
  const int ADC_PIN = 36;      // GPIO36 (VP) - ADC1_CH0, works with WiFi enabled
@@ -169,7 +169,7 @@
  // Relay Configuration
  // Most relay modules are "active LOW" - setting pin LOW energizes the coil
  // If your relay works opposite (HIGH = ON), set this to false
- const bool RELAY_ACTIVE_LOW = false;
+const bool RELAY_ACTIVE_LOW = true;
  
  // Voltage Divider Configuration
  // IMPORTANT: Choose resistor values that keep ADC voltage ≤ 3.3V
@@ -182,8 +182,8 @@
  // For safety: Vadc_max should be < 3.3V when Vbat is at maximum (14.6V)
  //
  // CURRENT WIRING: 100kΩ on top, 10kΩ on bottom (SAFE - same ratio as 10k/1k)
- const float RTOP = 10000.0;  // Top resistor (Battery+ to ADC node) in Ohms  
- const float RBOT = 1000.0;   // Bottom resistor (ADC node to GND) in Ohms
+const float RTOP = 100000.0;  // Top resistor (Battery+ to ADC node) in Ohms  
+const float RBOT = 10000.0;   // Bottom resistor (ADC node to GND) in Ohms
  
  // ADC Configuration
  // ADC Calibration
