@@ -36,6 +36,7 @@ Monitors your battery voltage continuously. Uses two thresholds to protect your 
 | Battery | 8V-16V (tested with 12.8V LiFePO4) |
 | **Charge Controller** | **REQUIRED for solar panels!** MPPT or PWM, rated for your panel |
 | Wires | Jumper wires and power wires |
+| Slide switch (optional) | SPST for battery disconnect during programming |
 
 ⚠️ **CRITICAL: If using a solar panel, you MUST have a charge controller!** Without it, the solar panel voltage (30-40V for a 380W panel) will destroy the ESP32 and 5V converter when the sun comes out!
 
@@ -81,6 +82,20 @@ ESP32 GND ──→ Relay GND
 5V power supply ──→ ESP32 VIN
 GND ──→ ESP32 GND
 ```
+
+### E. Battery Programming Switch (Recommended)
+
+To allow code uploads while the battery is connected, add a switch in the battery positive line:
+
+```
+Battery + ──→ [SPST Switch] ──→ Rest of circuit
+```
+
+**Switch positions:**
+- **OFF:** Disconnects battery power, allows USB programming
+- **ON:** Normal operation with battery power
+
+This prevents power conflicts between USB and battery that can interfere with serial communication during uploads.
 
 ### IMPORTANT: Common Ground
 
@@ -418,6 +433,37 @@ date -r $((TIMESTAMP / 1000))
 
 ## Troubleshooting
 
+### Can't Upload Code When Battery Is Connected
+
+**Problem:** Computer doesn't recognize USB port when battery is connected
+
+**Why this happens:** When battery power is connected, it can interfere with the USB-serial chip's ability to communicate with your computer. This is a hardware-level conflict that occurs before any code runs.
+
+**Solution: Add a battery disconnect switch**
+
+Install a simple SPST (Single Pole Single Throw) slide switch in the battery positive line:
+
+```
+Battery + ──→ [SPST Switch] ──→ Circuit
+```
+
+**To upload new code:**
+1. Turn the switch OFF (disconnects battery)
+2. Connect USB cable
+3. Upload code normally
+4. Disconnect USB (optional)
+5. Turn the switch ON (reconnects battery)
+
+**Recommended switches:**
+- Mini slide switch (breadboard-friendly)
+- Toggle switch (panel mount for enclosures)
+- JST connector (for quick disconnect without a switch)
+
+**Alternative solutions:**
+- Use a JST connector on the battery wire for quick disconnect
+- Add a Schottky diode (1N5817) in series with battery positive for isolation (loses ~0.3V)
+- For permanent installations, design a proper power path management circuit
+
 ### Wrong Voltage Reading
 
 **Problem:** Displayed voltage doesn't match multimeter
@@ -507,6 +553,7 @@ const float RBOT = 10000.0;   // Change to your measured value
 **Problem:** Upload fails with serial errors
 
 **Fix:**
+- If battery is connected, disconnect it or turn off the battery switch (see above)
 - Close Serial Monitor before uploading
 - Try different USB cable
 - Use /dev/tty.usbserial-* port instead of /dev/cu.*
@@ -578,39 +625,15 @@ This is well below the 3.3V maximum for ESP32 ADC. Safe operation confirmed.
 
 ## Safety Notes
 
-### ⚠️ CRITICAL: Solar Panel Protection
-
-**If you have a solar panel, you MUST use a charge controller!**
-
-**Why:**
-- Solar panels output very high voltages (30-40V for a 380W panel)
-- The 5V converter can only handle 20-30V maximum input
-- Without a charge controller, when the sun comes out, the voltage spike will:
-  - Destroy the 5V converter
-  - Burn out the ESP32
-  - Damage other components
-
-**Correct Wiring:**
-```
-Solar Panel → Charge Controller INPUT
-Charge Controller OUTPUT → Battery Positive
-Battery → 5V Converter VIN
-```
-
-**NEVER connect solar panel directly to battery or converter!**
-
-### General Safety
-
-1. **ALWAYS use a charge controller with solar panels** - This is the #1 cause of ESP32 failure!
-2. Check battery voltage rating before connecting
-3. Connect all grounds together (battery, ESP32, relay, load)
-4. Verify relay current rating matches your load
-5. Use appropriate wire gauge for load current
-6. Test voltage reading with multimeter before connecting load
-7. Calibrate ADC before relying on voltage readings
-8. Never short circuit battery terminals
-9. Double-check wiring before powering on
-10. Check your 5V converter's maximum input voltage rating
+1. Check battery voltage rating before connecting
+2. Connect all grounds together (battery, ESP32, relay, load)
+3. Verify relay current rating matches your load
+4. Use appropriate wire gauge for load current
+5. Test voltage reading with multimeter before connecting load
+6. Calibrate ADC before relying on voltage readings
+7. Never short circuit battery terminals
+8. Double-check wiring before powering on
+9. Use battery disconnect switch when programming to avoid USB conflicts
 
 ---
 
