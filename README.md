@@ -34,8 +34,11 @@ Monitors your battery voltage continuously. Uses two thresholds to protect your 
 | Bottom resistor | 10kΩ (Brown-Black-Orange) |
 | Capacitor | 0.1µF to 1µF ceramic |
 | Battery | 8V-16V (tested with 12.8V LiFePO4) |
+| **Charge Controller** | **REQUIRED for solar panels!** MPPT or PWM, rated for your panel |
 | Wires | Jumper wires and power wires |
 | Slide switch (optional) | SPST for battery disconnect during programming |
+
+⚠️ **CRITICAL: If using a solar panel, you MUST have a charge controller!** Without it, the solar panel voltage (30-40V for a 380W panel) will destroy the ESP32 and 5V converter when the sun comes out!
 
 ---
 

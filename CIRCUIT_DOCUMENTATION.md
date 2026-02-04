@@ -81,8 +81,12 @@ Purple Air Sensor (Load)
 - → 100kΩ Resistor (for voltage measurement)
 
 **Solar Panel Positive (+):**
-- → Same connection as Battery Positive
-- *(Charge controller should be between solar and battery)*
+- ⚠️ **CRITICAL: MUST use a charge controller!**
+- → Charge Controller INPUT
+- Charge Controller OUTPUT → Battery Positive (+)
+- **NEVER connect solar panel directly to battery!**
+- A 380W solar panel can output 30-40V open circuit voltage
+- This will destroy the 5V converter and ESP32!
 
 **Battery Negative (-) & Solar Negative (-):**
 - → Common Ground (all GNDs connected)
@@ -295,22 +299,40 @@ Runtime = 230.4 Wh / 6.1W = 37.7 hours (1.5 days)
 
 ### ⚠️ CRITICAL SAFETY NOTES
 
-1. **Common Ground Required**
+1. **SOLAR PANEL PROTECTION - HIGHEST PRIORITY**
+   - ⚠️ **MUST use a charge controller between solar panel and battery!**
+   - A 380W solar panel can output 30-40V open circuit voltage
+   - Direct connection will destroy the 5V converter and ESP32
+   - Charge controller limits voltage to safe levels (typically 14-15V for 12V systems)
+   - **Without a charge controller, the ESP32 WILL BURN when sun comes out!**
+   - Recommended: MPPT or PWM charge controller rated for your panel voltage/current
+
+2. **5V Converter Input Voltage Limits**
+   - Check your converter's maximum input voltage rating
+   - Most converters: 20-30V maximum input
+   - Solar panel open circuit voltage can exceed this
+   - Charge controller prevents overvoltage damage
+
+3. **Common Ground Required**
    - All negative terminals MUST be connected together
    - Missing common ground = incorrect voltage readings and relay malfunction
 
-2. **Resistor Values**
+4. **Resistor Values**
    - MUST use 100kΩ top, 10kΩ bottom (or equivalent 11:1 ratio)
    - Wrong values can damage ESP32 ADC (over-voltage)
    - Verify with multimeter before connecting
 
-3. **Battery Protection**
+5. **Battery Protection**
    - Never let LiFePO4 drop below 10V (cell damage)
    - Default 12V cutoff is safe for most applications
    - Adjust thresholds based on your battery specifications
 
-4. **Solar Panel**
-   - Use a proper solar charge controller between panel and battery
+6. **Solar Panel Wiring**
+   - Solar Panel → Charge Controller INPUT
+   - Charge Controller OUTPUT → Battery Positive
+   - Charge Controller GND → Common Ground
+   - Battery → 5V Converter VIN
+   - **NEVER bypass the charge controller!**
    - Direct connection can overcharge/damage battery
    - Charge controller not shown in simplified diagram
 
