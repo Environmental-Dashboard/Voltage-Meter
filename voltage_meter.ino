@@ -91,7 +91,7 @@
  *   VCC: Connected to the VOUT of the 5V Step Up/Down Converter.
  *   GND: Connected to the ground net shared with the ESP32, battery, and 
  *        other components.
- *   IN: Connected to the D2 pin of the ESP32.
+ *   IN: Connected to the D27 pin of the ESP32.
  *   NC: Connected to the positive pin of the Purple Air Sensor.
  *   COM: Connected to the positive terminals of the battery and solar panel.
  * 
@@ -118,12 +118,30 @@
  * 
  * FEATURES:
  * - Measures battery voltage via voltage divider into ADC1 pin (GPIO36/VP)
- * - Controls NO relay to disconnect load at low voltage
+ * - Controls relay to disconnect load at low voltage
  * - Simple logic: voltage above reconnect = ON, voltage below cutoff = OFF
  * - Web interface with live updates
  * - JSON API endpoint for external monitoring
  * - Dynamic threshold adjustment via web API
  * - Serial output for debugging (CSV format)
+ * 
+ * NEW FEATURES ADDED (Day/Night profiles + UTF-8):
+ * - Uses NTP time to select Day vs Night cutoff/reconnect thresholds automatically
+ * - Day and Night thresholds are independently adjustable via existing /settings endpoint
+ * - Web UI retained, plus UTF-8 charset enabled for correct emoji rendering
+ * 
+ * CALIBRATION FIX (NEW CHANGE YOU REQUESTED):
+ * - Adds readBatteryVoltageRaw() (uncalibrated / unsmoothed)
+ * - /settings?target=... now calibrates using RAW averaged readings (reliable)
+ * 
+ * NEW POWER-SAVING FEATURE (THIS UPDATE):
+ * - ESP32 wakes periodically (e.g., every 1 minute), connects to WiFi, runs the web server
+ *   for a short awake window (e.g., 60 seconds), then deep-sleeps to save power.
+ * - Relay state is applied before sleeping and the relay GPIO is held during deep sleep.
+ * 
+ * IMPORTANT TRADEOFF:
+ * - While the ESP32 is in deep sleep, the web UI will NOT be reachable.
+ * - Battery/relay decisions are evaluated on wake (so switching resolution is the wake interval).
  * 
  * ============================================================================
  */
@@ -131,6 +149,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>  // For persistent storage (replaces EEPROM on ESP32)
+#include <time.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 
 // ============================================================================
 // CONFIGURATION SECTION - MODIFY THESE VALUES FOR YOUR SETUP
@@ -148,7 +169,7 @@ const int RELAY_PIN = 27;    // GPIO27 (D27) - Controls relay module
 // Relay Configuration
 // Most relay modules are "active LOW" - setting pin LOW energizes the coil
 // If your relay works opposite (HIGH = ON), set this to false
-const bool RELAY_ACTIVE_LOW = true;
+const bool RELAY_ACTIVE_LOW = false;
 
 // Voltage Divider Configuration
 // IMPORTANT: Choose resistor values that keep ADC voltage ≤ 3.3V
@@ -161,8 +182,8 @@ const bool RELAY_ACTIVE_LOW = true;
 // For safety: Vadc_max should be < 3.3V when Vbat is at maximum (14.6V)
 //
 // CURRENT WIRING: 100kΩ on top, 10kΩ on bottom (SAFE - same ratio as 10k/1k)
-const float RTOP = 100000.0;  // Top resistor (Battery+ to ADC node) in Ohms  
-const float RBOT = 10000.0;   // Bottom resistor (ADC node to GND) in Ohms
+const float RTOP = 10000.0;  // Top resistor (Battery+ to ADC node) in Ohms  
+const float RBOT = 1000.0;   // Bottom resistor (ADC node to GND) in Ohms
 
 // ADC Configuration
 // ADC Calibration
@@ -176,6 +197,33 @@ const int ADC_MAX = 4095;     // 12-bit ADC resolution (0-4095)
 float CALIBRATION_FACTOR = 1.0;  // Calibration factor (1.0 = no calibration, adjust as needed)
 Preferences preferences;  // For saving calibration to flash memory
 const int SAMPLES = 200;      // Number of samples to average for stable reading (increased for maximum stability)
+
+// ============================================================================
+// POWER SAVING (NEW FEATURE)
+// ============================================================================
+//
+// Wake up every WAKE_INTERVAL_MINUTES, connect to WiFi, serve UI for AWAKE_WINDOW_SECONDS,
+// then go to deep sleep.
+//
+// NOTE: While sleeping, the web UI is offline.
+// NOTE: Relay decisions are evaluated once per wake cycle.
+// NOTE: These values are adjustable via web UI and saved to flash memory.
+//
+uint32_t WAKE_INTERVAL_MINUTES = 1;   // Wake interval in minutes (adjustable via UI)
+uint32_t AWAKE_WINDOW_SECONDS  = 120; // Awake window in seconds (adjustable via UI)
+
+// ============================================================================
+// DAY / NIGHT PROFILE SETTINGS
+// ============================================================================
+
+const int NIGHT_START_HOUR = 22; // 10 PM
+const int DAY_START_HOUR   = 8;  // 8 AM
+
+float NIGHT_CUTOFF    = 11.5;
+float NIGHT_RECONNECT = 12.5;
+
+float DAY_CUTOFF      = 12.0;
+float DAY_RECONNECT   = 12.6;
 
 // ============================================================================
 // BATTERY PROTECTION THRESHOLDS - CUSTOMIZE THESE FOR YOUR NEEDS
@@ -237,9 +285,10 @@ const int SAMPLES = 200;      // Number of samples to average for stable reading
 //
 // ============================================================================
 
-// Thresholds are changeable via web interface
+// Backward-compatible "active profile" thresholds (used by old UI/JSON keys)
+// These are automatically set based on day/night profile
 float V_CUTOFF = 12.0;           // Disconnect load at or below this voltage (changeable)
-float V_RECONNECT = 12.9;        // Reconnect load at or above this voltage (changeable)
+float V_RECONNECT = 12.6;        // Reconnect load at or above this voltage (changeable)
 
 // ============================================================================
 
@@ -266,9 +315,44 @@ const unsigned long FORTY_EIGHT_HOURS_MS = 48UL * 60UL * 60UL * 1000UL; // 48 ho
 
 // Moving average for ultra-stable voltage display
 const int DISPLAY_SAMPLES = 30;  // Increased for maximum stability (30 samples = 7.5 seconds of history)
-float voltageHistory[30] = {0};
+float voltageHistory[DISPLAY_SAMPLES] = {0};
 int voltageIndex = 0;
 bool historyInitialized = false;  // Track if buffer is filled
+
+// Track awake window
+unsigned long bootMillis = 0;
+
+// ============================================================================
+// DAY / NIGHT TIME HELPERS
+// ============================================================================
+
+/**
+ * Determines if current time is night based on NIGHT_START_HOUR and DAY_START_HOUR
+ * 
+ * @return true if it's night time, false if day time (or if time not available)
+ */
+bool isNightTime() {
+  struct tm t;
+  if (!getLocalTime(&t)) return false; // If time not available, treat as day
+  return (t.tm_hour >= NIGHT_START_HOUR || t.tm_hour < DAY_START_HOUR);
+}
+
+/**
+ * Refreshes the active thresholds (V_CUTOFF, V_RECONNECT) based on current day/night profile
+ * Enforces minimum hysteresis gap of 0.3V
+ */
+void refreshActiveThresholds() {
+  bool night = isNightTime();
+
+  float cutoff    = night ? NIGHT_CUTOFF    : DAY_CUTOFF;
+  float reconnect = night ? NIGHT_RECONNECT : DAY_RECONNECT;
+
+  // Enforce minimum hysteresis gap
+  if (reconnect < cutoff + 0.3f) reconnect = cutoff + 0.3f;
+
+  V_CUTOFF = cutoff;
+  V_RECONNECT = reconnect;
+}
 
 // ============================================================================
 // RELAY CONTROL FUNCTIONS
@@ -332,6 +416,23 @@ void applyLoadState(bool wantLoadOn) {
   loadEnabled = wantLoadOn;
   // NO relay logic: To enable load, relay must be energized
   setRelayEnergized(wantLoadOn);
+}
+
+/**
+ * Holds the relay GPIO state during deep sleep so the relay does not glitch.
+ * GPIO27 is RTC-capable on ESP32, so RTC hold can be used 
+ */
+void holdRelayPinDuringSleep() {
+  // Ensure the pin is RTC capable before using rtc_gpio_* (GPIO27 is RTC-capable)
+  rtc_gpio_hold_dis((gpio_num_t)RELAY_PIN);          // disable hold while updating
+  rtc_gpio_set_direction((gpio_num_t)RELAY_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
+
+  // Read current digital level and hold it
+  int level = digitalRead(RELAY_PIN);
+  rtc_gpio_set_level((gpio_num_t)RELAY_PIN, level);
+
+  rtc_gpio_hold_en((gpio_num_t)RELAY_PIN);           // enable hold for the pin
+  gpio_deep_sleep_hold_en();                         // enable deep-sleep hold globally
 }
 
 /**
@@ -438,6 +539,38 @@ float readBatteryVoltage() {
   return vBat;
 }
 
+// ===========================
+// NEW: RAW reading (NO calibration, NO smoothing) for target calibration
+// ===========================
+/**
+ * Reads battery voltage without applying calibration factor or smoothing
+ * Used for calibration purposes where we need the raw, uncalibrated reading
+ * 
+ * @return Raw battery voltage (uncalibrated, unsmoothed)
+ */
+float readBatteryVoltageRaw() {
+  float samples[SAMPLES];
+
+  for (int i = 0; i < SAMPLES; i++) {
+    samples[i] = (float)analogRead(ADC_PIN);
+    delayMicroseconds(500);
+  }
+
+  sortArray(samples, SAMPLES);
+
+  int discard = SAMPLES / 10;
+  long sum = 0;
+  for (int i = discard; i < SAMPLES - discard; i++) {
+    sum += (long)samples[i];
+  }
+
+  float avgADC = (float)sum / (float)(SAMPLES - 2 * discard);
+  float vAdc = (avgADC / (float)ADC_MAX) * VREF;
+
+  // IMPORTANT: no calibration factor here
+  return vAdc * ((RTOP + RBOT) / RBOT);
+}
+
 // ============================================================================
 // BATTERY PERCENTAGE ESTIMATION
 // ============================================================================
@@ -494,13 +627,15 @@ int lifepo4Percent(float v) {
  */
 String htmlPage() {
   String ip = WiFi.isConnected() ? WiFi.localIP().toString() : String("not connected");
-  
+
   String s;
-  
+
   // HTML head with responsive viewport and styling
-  s += "<!doctype html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  s += "<!doctype html><html><head>";
+  s += "<meta charset='UTF-8'>";
+  s += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
   s += "<title>Battery Monitor</title>";
-  
+
   // Embedded CSS for clean, simple design
   s += "<style>";
   s += "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;padding:20px;background:#f8f9fa;margin:0}";
@@ -515,92 +650,265 @@ String htmlPage() {
   s += ".status-off{background:#f8d7da;color:#721c24}";
   s += ".status-auto{background:#fff3cd;color:#856404}";
   s += ".status-manual{background:#e2e3e5;color:#383d41}";
+  s += ".status-night{background:#343a40;color:#f8f9fa}";
+  s += ".status-day{background:#ffeeba;color:#856404}";
   s += ".threshold{color:#0066cc;font-weight:600}";
   s += ".buttons{display:flex;gap:8px;margin-top:24px}";
   s += "button{flex:1;padding:14px;border-radius:10px;border:none;background:#007bff;color:white;cursor:pointer;font-size:15px;font-weight:600;transition:all 0.2s}";
   s += "button:hover{background:#0056b3;transform:translateY(-1px)}";
   s += "button:active{transform:translateY(0)}";
   s += "small{color:#6c757d;display:block;text-align:center;margin-top:20px;font-size:13px}";
+  s += ".notification{position:fixed;top:20px;right:20px;background:#28a745;color:white;padding:16px 24px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.3);z-index:10000;font-weight:600;font-size:15px;opacity:0;transform:translateY(-20px);transition:all 0.3s ease;pointer-events:none;max-width:400px;min-width:250px;display:block}";
+  s += ".notification.show{opacity:1;transform:translateY(0);pointer-events:auto}";
+  s += ".notification.error{background:#dc3545}";
   s += "</style>";
   s += "</head><body>";
-  
+
   // Main content card
   s += "<div class='card'>";
   s += "<h1>🔋 Battery Monitor</h1>";
-  
+
   // Large voltage display
-  s += "<div class='voltage' id='v'>--.-- V</div>";
-  
+  s += "<div class='voltage' id='v'>Loading...</div>";
+
   // Load status
   s += "<div class='info'>";
   s += "<span class='label'>Load Status</span>";
-  s += "<span class='status' id='on'>--</span>";
+  s += "<span class='status' id='on'>Loading...</span>";
   s += "</div>";
-  
+
   // Control mode
   s += "<div class='info'>";
   s += "<span class='label'>Control Mode</span>";
-  s += "<span class='status' id='mode'>--</span>";
+  s += "<span class='status' id='mode'>Loading...</span>";
   s += "</div>";
-  
+
+  s += "<div class='info'><span class='label'>Profile</span><span class='status' id='profile'>Loading...</span></div>";
+
   // Thresholds
   s += "<div class='info'>";
   s += "<span class='label'>Turn OFF at</span>";
   s += "<span class='value'><span class='threshold' id='lower'>--</span> V</span>";
   s += "</div>";
-  
+
   s += "<div class='info'>";
   s += "<span class='label'>Turn ON at</span>";
   s += "<span class='value'><span class='threshold' id='upper'>--</span> V</span>";
   s += "</div>";
-  
+
+  s += "<div class='info'><span class='label'>Day OFF / ON</span><span class='value'><span class='threshold' id='day_lower'>--</span> / <span class='threshold' id='day_upper'>--</span> V</span></div>";
+  s += "<div class='info'><span class='label'>Night OFF / ON</span><span class='value'><span class='threshold' id='night_lower'>--</span> / <span class='threshold' id='night_upper'>--</span> V</span></div>";
+
   s += "<small style='text-align:center;color:#6c757d;margin:8px 0;display:block'>";
   s += "Hysteresis: OFF at ≤ lower, ON at ≥ upper, between = no change";
   s += "</small>";
-  
-  // Control buttons
+
+  // Power saving settings
+  s += "<div style='margin-top:24px;padding-top:24px;border-top:1px solid #e9ecef'>";
+  s += "<h2 style='font-size:18px;font-weight:600;color:#1a1a1a;margin:0 0 16px 0'>⚡ Power Saving</h2>";
+
+  s += "<div class='info' style='flex-direction:column;align-items:flex-start;gap:8px'>";
+  s += "<div style='display:flex;justify-content:space-between;width:100%;align-items:center'>";
+  s += "<span class='label'>Wake Interval</span>";
+  s += "<div style='display:flex;gap:8px;align-items:center'>";
+  s += "<input type='number' id='wake_interval' min='1' max='1440' step='1' style='width:80px;padding:8px;border:1px solid #ced4da;border-radius:6px;font-size:14px;text-align:center' />";
+  s += "<span style='color:#6c757d;font-size:14px'>minutes</span>";
+  s += "<button id='save_wake' style='padding:8px 16px;margin-left:8px;font-size:13px;flex:none'>Save</button>";
+  s += "</div></div>";
+  s += "<small style='color:#6c757d;font-size:12px'>How often the device wakes up (1-1440 min)</small>";
+  s += "</div>";
+
+  s += "<div class='info' style='flex-direction:column;align-items:flex-start;gap:8px;margin-top:12px'>";
+  s += "<div style='display:flex;justify-content:space-between;width:100%;align-items:center'>";
+  s += "<span class='label'>Awake Window</span>";
+  s += "<div style='display:flex;gap:8px;align-items:center'>";
+  s += "<input type='number' id='awake_window' min='10' max='300' step='5' style='width:80px;padding:8px;border:1px solid #ced4da;border-radius:6px;font-size:14px;text-align:center' />";
+  s += "<span style='color:#6c757d;font-size:14px'>seconds</span>";
+  s += "<button id='save_awake' style='padding:8px 16px;margin-left:8px;font-size:13px;flex:none'>Save</button>";
+  s += "</div></div>";
+  s += "<small style='color:#6c757d;font-size:12px'>How long the device stays awake to serve web UI (10-300 sec)</small>";
+  s += "</div>";
+  s += "</div>";
+
+  // Control buttons (NO inline onclick — wired in JS so tick() is in-scope)
   s += "<div class='buttons'>";
-  s += "<button onclick=\"fetch('/relay?auto=1').then(()=>tick())\">Auto</button>";
-  s += "<button onclick=\"fetch('/relay?on=1').then(()=>tick())\">Force ON</button>";
-  s += "<button onclick=\"fetch('/relay?on=0').then(()=>tick())\">Force OFF</button>";
+  s += "<button id='btn_auto'>Auto</button>";
+  s += "<button id='btn_on'>Force ON</button>";
+  s += "<button id='btn_off'>Force OFF</button>";
   s += "</div>";
-  
+
   // Footer
-  s += "<small>" + ip + " • Updates every second</small>";
+  s += "<small>" + ip + " • Updates every 5 seconds (while awake)</small>";
   s += "</div>";
-  
+
+  // Single notification toast (ONLY ONCE)
+  s += "<div id='notification' class='notification' style='display:none'></div>";
+
   // JavaScript for live updates
   s += "<script>";
-  s += "async function tick(){";
-  s += "  try{";
-  s += "    const r = await fetch('/status.json',{cache:'no-store'});";
-  s += "    const j = await r.json();";
-  
-  // Update voltage
-  s += "    document.getElementById('v').textContent = j.voltage_v.toFixed(2) + ' V';";
-  
-  // Update load status
-  s += "    const loadElem = document.getElementById('on');";
-  s += "    loadElem.textContent = j.load_on ? 'ON' : 'OFF';";
-  s += "    loadElem.className = 'status ' + (j.load_on ? 'status-on' : 'status-off');";
-  
-  // Update mode
-  s += "    const modeElem = document.getElementById('mode');";
-  s += "    modeElem.textContent = j.auto_mode ? 'AUTO' : 'MANUAL';";
-  s += "    modeElem.className = 'status ' + (j.auto_mode ? 'status-auto' : 'status-manual');";
-  
-  // Update thresholds
-  s += "    document.getElementById('lower').textContent = j.v_cutoff.toFixed(2);";
-  s += "    document.getElementById('upper').textContent = j.v_reconnect.toFixed(2);";
-  
-  s += "  }catch(e){console.error('Fetch error:',e);}";
-  s += "}";
-  s += "setInterval(tick,1000); tick();";
+  s += "(function(){";
+  s += "  function byId(id){ return document.getElementById(id); }";
+  s += "  function setText(id, text){ var el = byId(id); if(el) el.textContent = text; }";
+
+  s += "  function showNotification(message, isError){";
+  s += "    var notif = byId('notification');";
+  s += "    if(!notif){ return; }";
+  s += "    notif.textContent = message;";
+  s += "    notif.className = 'notification' + (isError ? ' error' : '');";
+  s += "    notif.style.display = 'block';";
+  s += "    notif.style.visibility = 'visible';";
+  s += "    setTimeout(function(){ if(notif.classList) notif.classList.add('show'); }, 10);";
+  s += "    setTimeout(function(){";
+  s += "      if(notif.classList) notif.classList.remove('show');";
+  s += "      setTimeout(function(){ notif.textContent=''; notif.style.display='none'; }, 300);";
+  s += "    }, 2500);";
+  s += "  }";
+
+  s += "  function xhrJson(url, timeoutMs, cb){";
+  s += "    var x = new XMLHttpRequest();";
+  s += "    x.open('GET', url, true);";
+  s += "    x.timeout = timeoutMs;";
+  s += "    x.onreadystatechange = function(){";
+  s += "      if(x.readyState !== 4) return;";
+  s += "      if(x.status >= 200 && x.status < 300){";
+  s += "        try{ cb(null, JSON.parse(x.responseText)); }catch(e){ cb(e); }";
+  s += "      } else { cb(new Error('HTTP ' + x.status)); }";
+  s += "    };";
+  s += "    x.ontimeout = function(){ cb(new Error('timeout')); };";
+  s += "    x.onerror = function(){ cb(new Error('network')); };";
+  s += "    x.send();";
+  s += "  }";
+
+  s += "  function xhrText(url, timeoutMs, cb){";
+  s += "    var x = new XMLHttpRequest();";
+  s += "    x.open('GET', url, true);";
+  s += "    x.timeout = timeoutMs;";
+  s += "    x.onreadystatechange = function(){";
+  s += "      if(x.readyState !== 4) return;";
+  s += "      if(x.status >= 200 && x.status < 300){ cb(null, x.responseText); }";
+  s += "      else { cb(new Error('HTTP ' + x.status)); }";
+  s += "    };";
+  s += "    x.ontimeout = function(){ cb(new Error('timeout')); };";
+  s += "    x.onerror = function(){ cb(new Error('network')); };";
+  s += "    x.send();";
+  s += "  }";
+
+  s += "  function applyStatus(j){";
+  s += "    if(j && j.voltage_v != null) setText('v', Number(j.voltage_v).toFixed(2) + ' V');";
+  s += "    if(j && j.load_on != null){";
+  s += "      var loadElem = byId('on');";
+  s += "      if(loadElem){";
+  s += "        loadElem.textContent = j.load_on ? 'ON' : 'OFF';";
+  s += "        loadElem.className = 'status ' + (j.load_on ? 'status-on' : 'status-off');";
+  s += "      }";
+  s += "    }";
+  s += "    if(j && j.auto_mode != null){";
+  s += "      var modeElem = byId('mode');";
+  s += "      if(modeElem){";
+  s += "        modeElem.textContent = j.auto_mode ? 'AUTO' : 'MANUAL';";
+  s += "        modeElem.className = 'status ' + (j.auto_mode ? 'status-auto' : 'status-manual');";
+  s += "      }";
+  s += "    }";
+  s += "    if(j && j.night != null){";
+  s += "      var profileElem = byId('profile');";
+  s += "      if(profileElem){ profileElem.textContent = j.night ? '🌙 Night' : '☀️ Day'; }";
+  s += "    }";
+  s += "    if(j && j.v_cutoff != null) setText('lower', Number(j.v_cutoff).toFixed(2));";
+  s += "    if(j && j.v_reconnect != null) setText('upper', Number(j.v_reconnect).toFixed(2));";
+  s += "    if(j){";
+  s += "      if(j.day_cutoff != null) setText('day_lower', Number(j.day_cutoff).toFixed(2));";
+  s += "      if(j.day_reconnect != null) setText('day_upper', Number(j.day_reconnect).toFixed(2));";
+  s += "      if(j.night_cutoff != null) setText('night_lower', Number(j.night_cutoff).toFixed(2));";
+  s += "      if(j.night_reconnect != null) setText('night_upper', Number(j.night_reconnect).toFixed(2));";
+
+  s += "      var wakeInput = byId('wake_interval');";
+  s += "      var awakeInput = byId('awake_window');";
+  s += "      var active = document.activeElement;";
+
+  s += "      if(wakeInput && active !== wakeInput){";
+  s += "        var lastSave = Number(wakeInput.getAttribute('data-last-save') || '0');";
+  s += "        if(Date.now() - lastSave > 2000 && j.wake_interval_minutes != null){ wakeInput.value = j.wake_interval_minutes; }";
+  s += "      }";
+  s += "      if(awakeInput && active !== awakeInput){";
+  s += "        var lastSave2 = Number(awakeInput.getAttribute('data-last-save') || '0');";
+  s += "        if(Date.now() - lastSave2 > 2000 && j.awake_window_seconds != null){ awakeInput.value = j.awake_window_seconds; }";
+  s += "      }";
+  s += "    }";
+  s += "  }";
+
+  // tick() stays inside this closure; buttons are wired here too
+  s += "  function tick(){";
+  s += "    if(byId('v') && byId('v').textContent === 'Loading...'){ setText('v','Connecting...'); }";
+  s += "    xhrJson('/status.json', 5000, function(err, j){";
+  s += "      if(err){";
+  s += "        setText('v', (err.message === 'timeout') ? 'Timeout' : ('Error: ' + err.message));";
+  s += "        setText('on', 'Error');";
+  s += "        setText('mode', 'Error');";
+  s += "        return;";
+  s += "      }";
+  s += "      applyStatus(j);";
+  s += "    });";
+  s += "  }";
+
+ s += "  function relayCmd(url){";
+s += "    showNotification('Sending command...', false);";
+s += "    var fullUrl = url + (url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();";
+s += "    xhrText(fullUrl, 5000, function(err){";
+s += "      if(err){ showNotification('Command failed: ' + err.message, true); return; }";
+s += "      showNotification('✓ Command sent', false);";
+s += "      setTimeout(function(){ tick(); }, 150);";
+s += "    });";
+s += "  }";
+
+
+  s += "  function updatePowerSettings(){";
+  s += "    var wakeInput = byId('wake_interval');";
+  s += "    var awakeInput = byId('awake_window');";
+  s += "    if(!wakeInput || !awakeInput){ showNotification('UI error: inputs missing', true); return; }";
+  s += "    var wake = parseInt(wakeInput.value, 10);";
+  s += "    var awake = parseInt(awakeInput.value, 10);";
+  s += "    if(isNaN(wake) || isNaN(awake)){ showNotification('Enter valid numbers', true); return; }";
+  s += "    if(wake < 1 || wake > 1440){ showNotification('Wake interval must be 1–1440 min', true); return; }";
+  s += "    if(awake < 10 || awake > 300){ showNotification('Awake window must be 10–300 sec', true); return; }";
+  s += "    showNotification('Saving power settings...', false);";
+  s += "    var url = '/settings?wake_interval=' + encodeURIComponent(wake) + '&awake_window=' + encodeURIComponent(awake);";
+  s += "    xhrJson(url, 8000, function(err, j){";
+  s += "      if(err){ showNotification('Save failed: ' + err.message, true); return; }";
+  s += "      var now = String(Date.now());";
+  s += "      wakeInput.setAttribute('data-last-save', now);";
+  s += "      awakeInput.setAttribute('data-last-save', now);";
+  s += "      if(j && j.wake_interval_minutes != null) wakeInput.value = j.wake_interval_minutes;";
+  s += "      if(j && j.awake_window_seconds != null) awakeInput.value = j.awake_window_seconds;";
+  s += "      showNotification('✓ Power settings saved', false);";
+  s += "      setTimeout(function(){ tick(); }, 300);";
+  s += "    });";
+  s += "  }";
+
+  s += "  function attach(){";
+  s += "    var sw = byId('save_wake');";
+  s += "    var sa = byId('save_awake');";
+  s += "    if(sw) sw.onclick = function(e){ if(e && e.preventDefault) e.preventDefault(); updatePowerSettings(); };";
+  s += "    if(sa) sa.onclick = function(e){ if(e && e.preventDefault) e.preventDefault(); updatePowerSettings(); };";
+
+  s += "    var bAuto = byId('btn_auto');";
+  s += "    var bOn   = byId('btn_on');";
+  s += "    var bOff  = byId('btn_off');";
+  s += "    if(bAuto) bAuto.onclick = function(e){ if(e && e.preventDefault) e.preventDefault(); relayCmd('/relay?auto=1'); };";
+  s += "    if(bOn)   bOn.onclick   = function(e){ if(e && e.preventDefault) e.preventDefault(); relayCmd('/relay?on=1'); };";
+  s += "    if(bOff)  bOff.onclick  = function(e){ if(e && e.preventDefault) e.preventDefault(); relayCmd('/relay?on=0'); };";
+  s += "  }";
+
+  // Init
+  s += "  attach();";
+  s += "  tick();";
+  s += "  setInterval(function(){ tick(); }, 5000);";
+  s += "})();";
   s += "</script>";
-  
+
   s += "</body></html>";
   return s;
 }
+
 
 // ============================================================================
 // WEB SERVER - REQUEST HANDLERS
@@ -611,7 +919,7 @@ String htmlPage() {
  * Serves the HTML web interface
  */
 void handleRoot() {
-  server.send(200, "text/html", htmlPage());
+  server.send(200, "text/html; charset=UTF-8", htmlPage());
 }
 
 /**
@@ -629,6 +937,9 @@ void handleRoot() {
  * }
  */
 void handleStatus() {
+  refreshActiveThresholds();
+  bool night = isNightTime();
+
   // Calculate turn-ON count in last 48 hours
   unsigned long currentTime = millis();
   unsigned long fortyEightHoursAgo = currentTime - FORTY_EIGHT_HOURS_MS;
@@ -646,12 +957,19 @@ void handleStatus() {
   json += "\"voltage_v\":" + String(lastVBat, 3) + ",";
   json += "\"load_on\":" + String(loadEnabled ? "true" : "false") + ",";
   json += "\"auto_mode\":" + String(autoMode ? "true" : "false") + ",";
+  json += "\"night\":" + String(night ? "true" : "false") + ",";
   json += "\"v_cutoff\":" + String(V_CUTOFF, 2) + ",";
   json += "\"v_reconnect\":" + String(V_RECONNECT, 2) + ",";
+  json += "\"day_cutoff\":" + String(DAY_CUTOFF, 2) + ",";
+  json += "\"day_reconnect\":" + String(DAY_RECONNECT, 2) + ",";
+  json += "\"night_cutoff\":" + String(NIGHT_CUTOFF, 2) + ",";
+  json += "\"night_reconnect\":" + String(NIGHT_RECONNECT, 2) + ",";
   json += "\"calibration_factor\":" + String(CALIBRATION_FACTOR, 4) + ",";
   json += "\"cycle_count\":" + String(cycleCount) + ",";
   json += "\"turn_on_count_48h\":" + String(turnOnCount48h) + ",";
   json += "\"last_switch_time_ms\":" + String(lastSwitchTime) + ",";
+  json += "\"wake_interval_minutes\":" + String(WAKE_INTERVAL_MINUTES) + ",";
+  json += "\"awake_window_seconds\":" + String(AWAKE_WINDOW_SECONDS) + ",";
   json += "\"uptime_ms\":" + String(millis());
   json += "}";
   server.send(200, "application/json", json);
@@ -672,21 +990,40 @@ void handleStatus() {
  * - http://ESP32_IP/relay?on=0
  */
 void handleRelay() {
-  // Check for auto mode request
+  bool requested = false;
+
+  Serial.print("HTTP /relay args: ");
+  Serial.println(server.args());
+
+  // ?auto=1  -> enable automatic mode (no immediate change forced)
   if (server.hasArg("auto") && server.arg("auto") == "1") {
     autoMode = true;
-    // Don't change load state, let automatic control handle it
+    requested = true;
+    Serial.println("-> Set autoMode = true");
   }
-  
-  // Check for manual on/off request
+
+  // ?on=1 or ?on=0 -> manual override + apply relay
   if (server.hasArg("on")) {
-    autoMode = false;  // Disable automatic control
+    autoMode = false;
     bool turnOn = (server.arg("on") == "1");
     applyLoadState(turnOn);
+    requested = true;
+
+    Serial.print("-> Manual command: load ");
+    Serial.println(turnOn ? "ON" : "OFF");
   }
-  
-  server.send(200, "text/plain", "OK");
+
+  // Return JSON so UI can confirm state
+  String json = "{";
+  json += "\"ok\":true,";
+  json += "\"requested\":" + String(requested ? "true" : "false") + ",";
+  json += "\"load_on\":" + String(loadEnabled ? "true" : "false") + ",";
+  json += "\"auto_mode\":" + String(autoMode ? "true" : "false");
+  json += "}";
+
+  server.send(200, "application/json", json);
 }
+
 
 /**
  * Handler for "/settings"
@@ -707,20 +1044,29 @@ void handleRelay() {
  */
 void handleSettings() {
   bool changed = false;
-  
-  // Accept threshold changes - can set one or both
+
+  refreshActiveThresholds();
+
+  // Threshold updates apply to ACTIVE profile (day vs night)
   if (server.hasArg("lower")) {
     float newValue = server.arg("lower").toFloat();
-    if (newValue > 8.0 && newValue < 15.0) {  // Safety limits
-      V_CUTOFF = newValue;
+    if (newValue > 8.0f && newValue < 15.0f) {
+      if (isNightTime()) NIGHT_CUTOFF = newValue;
+      else DAY_CUTOFF = newValue;
       changed = true;
     }
   }
-  
+
   if (server.hasArg("upper")) {
     float newValue = server.arg("upper").toFloat();
-    if (newValue > 8.0 && newValue < 15.0) {  // Safety limits
-      V_RECONNECT = newValue;
+    if (newValue > 8.0f && newValue < 15.0f) {
+      if (isNightTime()) {
+        if (newValue < NIGHT_CUTOFF + 0.3f) newValue = NIGHT_CUTOFF + 0.3f;
+        NIGHT_RECONNECT = newValue;
+      } else {
+        if (newValue < DAY_CUTOFF + 0.3f) newValue = DAY_CUTOFF + 0.3f;
+        DAY_RECONNECT = newValue;
+      }
       changed = true;
     }
   }
@@ -733,7 +1079,7 @@ void handleSettings() {
       CALIBRATION_FACTOR = newCal;
       changed = true;
       
-      // Save calibration factor to flash memory so it persists across reboots
+      //Save calibration factor to flash memory so it persists across reboots
       preferences.begin("voltmeter", false);
       preferences.putFloat("cal_factor", CALIBRATION_FACTOR);
       preferences.end();
@@ -745,123 +1091,211 @@ void handleSettings() {
     }
   }
   
-  // Method 2: Auto-calibration with target voltage (calculates factor automatically)
-  // Usage: /settings?target=13.5
-  // This automatically calculates and sets the calibration factor
+  // ===========================
+  // FIXED Target calibration (uses RAW averaged readings)
+  // ===========================
   if (server.hasArg("target")) {
     float targetVoltage = server.arg("target").toFloat();
-    if (targetVoltage > 8.0 && targetVoltage < 20.0) {  // Reasonable voltage range
-      // Get current reading (with current calibration)
-      float currentReading = lastVBat;
-      
-      if (currentReading > 0.1) {  // Make sure we have a valid reading
-        // Calculate what the calibration factor should be
-        // If current reading is with factor X, and we want target:
-        // target = raw * new_factor
-        // current = raw * old_factor
-        // So: new_factor = old_factor * (target / current)
-        float newFactor = CALIBRATION_FACTOR * (targetVoltage / currentReading);
-        
-        if (newFactor > 0.5 && newFactor < 2.0) {
+
+    if (targetVoltage > 8.0f && targetVoltage < 20.0f) {
+      bool prevAuto = autoMode;
+      bool prevLoad = loadEnabled;
+      autoMode = false;
+
+      Serial.println("! AUTO-CALIBRATION START");
+      Serial.print("  Target voltage: ");
+      Serial.println(targetVoltage, 3);
+
+      delay(300);
+
+      const int CAL_SAMPLES = 60; // ~2 seconds
+      float sum = 0.0f;
+      for (int i = 0; i < CAL_SAMPLES; i++) {
+        sum += readBatteryVoltageRaw();   // <-- uncalibrated, unsmoothed
+        delay(30);
+      }
+
+      float measuredRaw = sum / (float)CAL_SAMPLES;
+
+      Serial.print("  Measured RAW avg: ");
+      Serial.println(measuredRaw, 3);
+
+      if (measuredRaw > 0.1f) {
+        float newFactor = targetVoltage / measuredRaw;
+
+        if (newFactor > 0.5f && newFactor < 2.0f) {
           CALIBRATION_FACTOR = newFactor;
           changed = true;
-          
-          // Save to flash memory
+
           preferences.begin("voltmeter", false);
           preferences.putFloat("cal_factor", CALIBRATION_FACTOR);
           preferences.end();
-          
-          Serial.print("! AUTO-CALIBRATION:");
-          Serial.print("  Current reading: ");
-          Serial.print(currentReading, 2);
-          Serial.print("V, Target: ");
-          Serial.print(targetVoltage, 2);
-          Serial.print("V");
-          Serial.print(", Calculated factor: ");
-          Serial.println(CALIBRATION_FACTOR, 4);
+
+          Serial.print("  -> New calibration factor: ");
+          Serial.println(CALIBRATION_FACTOR, 5);
           Serial.println("  Calibration saved to flash memory");
+        } else {
+          Serial.println("! AUTO-CALIBRATION FAILED: factor out of range (0.5 to 2.0)");
         }
       } else {
-        Serial.println("! AUTO-CALIBRATION FAILED: No valid voltage reading yet");
+        Serial.println("! AUTO-CALIBRATION FAILED: raw reading invalid/too small");
       }
+
+      autoMode = prevAuto;
+      applyLoadState(prevLoad);
+
+      Serial.println("! AUTO-CALIBRATION END");
     }
   }
-  
-  // Validate that upper >= lower (can be equal for no hysteresis)
-  if (V_RECONNECT < V_CUTOFF) {
-    V_RECONNECT = V_CUTOFF;  // Force upper to at least equal lower
+
+  // Power saving settings (wake interval and awake window)
+  if (server.hasArg("wake_interval")) {
+    uint32_t newWake = server.arg("wake_interval").toInt();
+    if (newWake >= 1 && newWake <= 1440) {  // 1 minute to 24 hours
+      WAKE_INTERVAL_MINUTES = newWake;
+      changed = true;
+      
+      preferences.begin("voltmeter", false);
+      preferences.putUInt("wake_interval", WAKE_INTERVAL_MINUTES);
+      preferences.end();
+      
+      Serial.print("! WAKE INTERVAL CHANGED to: ");
+      Serial.print(WAKE_INTERVAL_MINUTES);
+      Serial.println(" minutes");
+      Serial.println("  Changes take effect on next wake cycle");
+    }
   }
+
+  if (server.hasArg("awake_window")) {
+    uint32_t newAwake = server.arg("awake_window").toInt();
+    if (newAwake >= 10 && newAwake <= 300) {  // 10 seconds to 5 minutes
+      AWAKE_WINDOW_SECONDS = newAwake;
+      changed = true;
+      
+      preferences.begin("voltmeter", false);
+      preferences.putUInt("awake_window", AWAKE_WINDOW_SECONDS);
+      preferences.end();
+      
+      Serial.print("! AWAKE WINDOW CHANGED to: ");
+      Serial.print(AWAKE_WINDOW_SECONDS);
+      Serial.println(" seconds");
+      Serial.println("  Changes take effect on next wake cycle");
+    }
+  }
+
+  refreshActiveThresholds();
   
-  // IMPORTANT: Re-evaluate load state immediately after threshold change
-  // This ensures the system responds to new thresholds right away
+  // Immediate re-evaluation if thresholds changed and autoMode is on
   if (changed && autoMode) {
-    Serial.println("! THRESHOLD CHANGE DETECTED - Re-evaluating load state");
-    Serial.print("  New cutoff: ");
-    Serial.print(V_CUTOFF, 2);
-    Serial.print("V, New reconnect: ");
-    Serial.print(V_RECONNECT, 2);
-    Serial.print("V, Current voltage: ");
-    Serial.print(lastVBat, 2);
-    Serial.println("V");
-    
-    // Always check and apply the correct state based on new thresholds
-    // When thresholds change:
-    // - If voltage <= new lower → OFF
-    // - If voltage > new lower → ON (immediately, ignore upper when threshold changes)
-    // - If voltage >= new upper → ON
-    if (lastVBat <= V_CUTOFF) {
-      // Voltage at or below new lower threshold - must be OFF
-      if (loadEnabled) {
-        Serial.println("  -> Turning load OFF (voltage at or below new lower threshold)");
-        applyLoadState(false);
-      } else {
-        Serial.println("  -> Load already OFF (voltage at or below new lower threshold)");
-      }
-    }
-    else if (lastVBat > V_CUTOFF) {
-      // Voltage is above new lower threshold - turn ON immediately
-      // This allows changing lower threshold below current voltage to turn load ON
-      if (!loadEnabled) {
-        Serial.print("  -> Turning load ON (voltage ");
-        Serial.print(lastVBat, 2);
-        Serial.print("V > new lower ");
-        Serial.print(V_CUTOFF, 2);
-        Serial.println("V)");
-        applyLoadState(true);
-      }
-      else {
-        Serial.println("  -> Load stays ON (voltage above new lower threshold)");
-      }
-    }
-    
-    // Force relay update to ensure hardware state matches
-    setRelayEnergized(loadEnabled);
-    Serial.print("  -> Relay pin ");
-    Serial.print(RELAY_PIN);
-    Serial.print(" set to ");
-    Serial.println(loadEnabled ? "LOW (energized)" : "HIGH (not energized)");
+    if (lastVBat <= V_CUTOFF) applyLoadState(false);
+    else applyLoadState(true);
   }
   
-  // Return current settings
+  // Return current settings (always return current values, even if not changed)
   String json = "{";
   json += "\"v_cutoff\":" + String(V_CUTOFF, 2) + ",";
   json += "\"v_reconnect\":" + String(V_RECONNECT, 2) + ",";
   json += "\"calibration_factor\":" + String(CALIBRATION_FACTOR, 4) + ",";
+  json += "\"wake_interval_minutes\":" + String(WAKE_INTERVAL_MINUTES) + ",";
+  json += "\"awake_window_seconds\":" + String(AWAKE_WINDOW_SECONDS) + ",";
   json += "\"changed\":" + String(changed ? "true" : "false");
   json += "}";
   
+  Serial.print("Settings response: ");
+  Serial.println(json);
   server.send(200, "application/json", json);
-  
-  if (changed) {
-    Serial.println("! SETTINGS CHANGED:");
-    Serial.print("  Cutoff: ");
-    Serial.print(V_CUTOFF, 2);
-    Serial.print("V, Reconnect: ");
-    Serial.print(V_RECONNECT, 2);
-    Serial.print("V, Current voltage: ");
-    Serial.print(lastVBat, 2);
-    Serial.println("V");
+}
+
+// ============================================================================
+// POWER SAVING HELPERS (NEW FEATURE)
+// ============================================================================
+
+/**
+ * Connects to WiFi (best-effort) with a short timeout.
+ * This is called at each wake-up to enable the web server during the awake window.
+ */
+void connectWiFiBestEffort() {
+  WiFi.setTxPower(WIFI_POWER_11dBm);  // keep your low-noise setting
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    delay(250);
+    Serial.print(".");
   }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+
+  } else {
+    Serial.println("WiFi connection failed (timeout)");
+    Serial.println("System will continue without WiFi");
+  }
+}
+
+/**
+ * Syncs NTP time (best-effort). If WiFi is not connected, time may not update.
+ */
+void syncTimeBestEffort() {
+  // Use US Eastern time rules.
+  setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  // Best-effort wait a little for NTP on first wake (do not block too long)
+  struct tm t;
+  for (int i = 0; i < 10; i++) {
+    if (getLocalTime(&t)) {
+      Serial.print("Time synced: ");
+      Serial.print(1900 + t.tm_year);
+      Serial.print("-");
+      Serial.print(1 + t.tm_mon);
+      Serial.print("-");
+      Serial.print(t.tm_mday);
+      Serial.print(" ");
+      Serial.print(t.tm_hour);
+      Serial.print(":");
+      Serial.println(t.tm_min);
+      return;
+    }
+    delay(200);
+  }
+  Serial.println("Time not available yet (using DAY profile until time is available).");
+}
+
+/**
+ * Prepares deep sleep and enters it.
+ * - Applies relay hold so relay does not glitch.
+ * - Turns off WiFi to save power.
+ * - Sleeps for WAKE_INTERVAL_MINUTES.
+ */
+void goToDeepSleep() {
+  Serial.println("Preparing for deep sleep...");
+
+  // Hold relay output level during deep sleep
+  holdRelayPinDuringSleep();
+
+  // Turn off WiFi to reduce current draw before sleeping
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Stop web server (not strictly required; deep sleep resets anyway)
+  server.stop();
+
+  // Set timer wakeup
+  uint64_t us = (uint64_t)WAKE_INTERVAL_MINUTES * 60ULL * 1000000ULL;
+  esp_sleep_enable_timer_wakeup(us);
+
+  Serial.print("Sleeping for ");
+  Serial.print(WAKE_INTERVAL_MINUTES);
+  Serial.println(" minutes...");
+
+  Serial.flush();
+  esp_deep_sleep_start();
 }
 
 // ============================================================================
@@ -872,22 +1306,43 @@ void setup() {
   // Initialize serial communication for debugging
   Serial.begin(115200);
   delay(300);  // Allow serial to stabilize
+
+  bootMillis = millis();
   
   Serial.println();
   Serial.println("========================================");
   Serial.println("  Battery Cutoff Monitor Starting");
   Serial.println("========================================");
   
-  // Load saved calibration factor from flash memory
+  // Load saved settings from flash memory
   preferences.begin("voltmeter", false);  // false = read/write mode
-  float savedCal = preferences.getFloat("cal_factor", 1.0);  // Default to 1.0 if not found
-  if (savedCal != 1.0) {
-    CALIBRATION_FACTOR = savedCal;
-    Serial.print("Loaded saved calibration factor: ");
-    Serial.println(CALIBRATION_FACTOR, 4);
-  } else {
-    Serial.println("No saved calibration found, using default: 1.0");
+  CALIBRATION_FACTOR = preferences.getFloat("cal_factor", 1.0);
+  
+  // Load wake interval, but if it's the old default (10), update to new default (1)
+  WAKE_INTERVAL_MINUTES = preferences.getUInt("wake_interval", 1);
+  if (WAKE_INTERVAL_MINUTES == 10) {
+    // Old default detected, update to new default
+    WAKE_INTERVAL_MINUTES = 1;
+    preferences.putUInt("wake_interval", 1);
+    Serial.println("! Updated wake interval from old default (10 min) to new default (1 min)");
   }
+  
+  // Load awake window, but if it's the old default (60), update to new default (120)
+  AWAKE_WINDOW_SECONDS = preferences.getUInt("awake_window", 120);
+  if (AWAKE_WINDOW_SECONDS == 60) {
+    // Old default detected, update to new default
+    AWAKE_WINDOW_SECONDS = 120;
+    preferences.putUInt("awake_window", 120);
+    Serial.println("! Updated awake window from old default (60 sec) to new default (120 sec)");
+  }
+  
+  preferences.end();
+  
+  Serial.print("Power saving settings: Wake every ");
+  Serial.print(WAKE_INTERVAL_MINUTES);
+  Serial.print(" min, stay awake ");
+  Serial.print(AWAKE_WINDOW_SECONDS);
+  Serial.println(" sec");
   
   // Configure relay pin as output
   pinMode(RELAY_PIN, OUTPUT);
@@ -896,15 +1351,6 @@ void setup() {
   analogReadResolution(12);                     // 12-bit resolution (0-4095)
   analogSetPinAttenuation(ADC_PIN, ADC_11db);  // 11dB attenuation (0-~3.3V, non-linear)
   
-  // Reduce WiFi TX power to minimize interference with ADC readings
-  // Lower power = less noise on power rail = more stable ADC
-  WiFi.setTxPower(WIFI_POWER_11dBm);  // Reduce from default 19.5dBm to minimize interference
-  
-  Serial.println("ADC configured: 12-bit, 11dB attenuation");
-  
-  // Initialize system in automatic mode with load enabled
-  autoMode = true;
-  
   // Initialize history array
   for (int i = 0; i < 288; i++) {
     turnOnHistory[i] = 0;
@@ -912,53 +1358,32 @@ void setup() {
   historyIndex = 0;
   historyCount = 0;
   
-  // Set initial state without counting as a cycle
+  // Start with load ON (state will be evaluated below)
   loadEnabled = true;
   setRelayEnergized(true);
   lastSwitchTime = millis();
   
-  Serial.println("Initial state: Load ON, Auto mode");
-  Serial.print("Voltage divider: ");
-  Serial.print(RTOP);
-  Serial.print("Ω / ");
-  Serial.print(RBOT);
-  Serial.print("Ω (ratio: ");
-  Serial.print((RTOP + RBOT) / RBOT, 2);
-  Serial.println(")");
-  
-  Serial.print("Cutoff: ");
-  Serial.print(V_CUTOFF);
-  Serial.print("V, Reconnect: ");
-  Serial.print(V_RECONNECT);
-  Serial.print("V, Calibration: ");
-  Serial.print(CALIBRATION_FACTOR, 4);
-  Serial.println(" (1.0 = no calibration)");
-  
-  // Connect to WiFi
-  Serial.println();
+  // Connect WiFi periodically (we are awake now)
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
+  connectWiFiBestEffort();
   
-  WiFi.mode(WIFI_STA);  // Station mode (client)
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Time config (best-effort each wake)
+  syncTimeBestEffort();
   
-  // Wait up to 15 seconds for connection
-  unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
-    delay(250);
-    Serial.print(".");
-  }
-  
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("WiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("Open in browser: http://");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("WiFi connection failed (timeout)");
-    Serial.println("System will continue without WiFi");
+  // Read voltage ONCE immediately on boot/wake, set thresholds, and apply relay logic.
+  // This ensures relay is correct even if the user never opens the web UI.
+  float rawVoltage = readBatteryVoltage();
+  lastVBat = smoothVoltage(rawVoltage);
+
+  refreshActiveThresholds();
+
+  if (autoMode) {
+    if (lastVBat <= V_CUTOFF) {
+      applyLoadState(false);
+    } else if (lastVBat >= V_RECONNECT) {
+      applyLoadState(true);
+    }
   }
   
   // Configure web server routes
@@ -972,7 +1397,7 @@ void setup() {
   Serial.println("Web server started");
   Serial.println("========================================");
   Serial.println();
-  Serial.println("CSV Output: Voltage,Percent,LoadState");
+  Serial.println("CSV Output: Voltage,LoadState");
   Serial.println();
 }
 
@@ -981,59 +1406,40 @@ void setup() {
 // ============================================================================
 
 void loop() {
-  // Handle incoming web requests
+  // Handle incoming web requests while awake
   server.handleClient();
-  
-  // Perform periodic voltage measurement and control logic
+
+  // Keep your original periodic measurement while awake
   static unsigned long lastReadTime = 0;
-  
-  // Update every 250ms (4 times per second)
   if (millis() - lastReadTime >= 250) {
     lastReadTime = millis();
-    
-    // Read battery voltage with smoothing
+
     float rawVoltage = readBatteryVoltage();
-    lastVBat = smoothVoltage(rawVoltage);  // Ultra-stable display value
-    
-    // Automatic control (only if in auto mode)
-    // Logic:
-    // - Voltage <= lower (cutoff) → Load OFF
-    // - Voltage >= upper (reconnect) → Load ON
-    // - Voltage between lower and upper → Stay in current state (hysteresis)
+    lastVBat = smoothVoltage(rawVoltage);
+
+    refreshActiveThresholds();
+
     if (autoMode) {
       if (lastVBat <= V_CUTOFF) {
-        // Voltage at or below lower threshold - turn OFF
-        if (loadEnabled) {
-          Serial.print("! CUTOFF: Battery voltage (");
-          Serial.print(lastVBat, 2);
-          Serial.print("V) at or below lower (");
-          Serial.print(V_CUTOFF, 2);
-          Serial.println("V), turning load OFF");
-          applyLoadState(false);
-        }
+        if (loadEnabled) applyLoadState(false);
+      } else if (lastVBat >= V_RECONNECT) {
+        if (!loadEnabled) applyLoadState(true);
       }
-      else if (lastVBat >= V_RECONNECT) {
-        // Voltage at or above upper threshold - turn ON
-        if (!loadEnabled) {
-          Serial.print("! RECONNECT: Battery voltage (");
-          Serial.print(lastVBat, 2);
-          Serial.print("V) at or above upper (");
-          Serial.print(V_RECONNECT, 2);
-          Serial.println("V), turning load ON");
-          applyLoadState(true);
-        }
-      }
-      // If voltage is between lower and upper, load stays in current state (hysteresis)
     }
-    
-    // Output CSV format to serial: voltage, load_state
-    // This format is easy to parse and log externally
+
     Serial.print(lastVBat, 2);
     Serial.print(",");
     Serial.println(loadEnabled ? 1 : 0);
+  }
+
+
+  // After the awake window expires, go to deep sleep to save power
+  if (millis() - bootMillis >= (AWAKE_WINDOW_SECONDS * 1000UL)) {
+    goToDeepSleep();
   }
 }
 
 // ============================================================================
 // END OF CODE
 // ============================================================================
+
