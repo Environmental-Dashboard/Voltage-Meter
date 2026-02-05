@@ -1,5 +1,684 @@
 /*
  * ============================================================================
+ * ESP32 Battery Cutoff Monitor - Power Optimized with Dashboard Control
+ * ============================================================================
+ * 
+ * VERSION: 2.0
+ * 
+ * FEATURES:
+ * - Deep sleep between readings (15 min default) for power savings
+ * - HTTP POST to FastAPI backend for remote monitoring
+ * - Two-way communication: receives commands from dashboard in POST response
+ * - Remote calibration via dashboard
+ * - Remote relay control (Force ON / Force OFF / Automatic)
+ * - Remote threshold adjustment
+ * - All settings persist in NVS across deep sleep and power cycles
+ * 
+ * POWER SAVINGS:
+ * - Original: ~2,400 mAh/day (web server always on)
+ * - Optimized: ~60 mAh/day (~97.5% reduction)
+ * 
+ * WORKFLOW PER WAKE CYCLE:
+ * 1. Wake from deep sleep
+ * 2. Read battery voltage
+ * 3. Connect to WiFi
+ * 4. POST data to backend
+ * 5. Parse response for commands (relay mode, thresholds, calibration)
+ * 6. Apply any changes
+ * 7. Apply relay logic
+ * 8. Enter deep sleep
+ * 
+ * ============================================================================
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
+
+// ============================================================================
+// CONFIGURATION - MODIFY THESE FOR YOUR SETUP
+// ============================================================================
+
+// WiFi Credentials (safe placeholders for public code)
+const char* WIFI_SSID = "YOUR_WIFI_SSID_HERE";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD_HERE";
+
+// API Configuration
+// NOTE: Keep real sensor IDs and tokens OUT of public repos.
+//       Replace these placeholders with values from your dashboard in a private config.
+const char* API_ENDPOINT = "https://sensor-dashboard.environmentaldashboard.org/api/esp32/voltage";
+const char* SENSOR_ID = "REPLACE_WITH_SENSOR_ID_FROM_DASHBOARD";
+const char* UPLOAD_TOKEN = "REPLACE_WITH_UPLOAD_TOKEN_FROM_DASHBOARD";
+
+// Pin Assignments
+const int ADC_PIN = 36;      // GPIO36 (VP) - ADC1_CH0
+const int RELAY_PIN = 27;    // GPIO27 (D27) - Controls relay
+
+// Relay Configuration (true = LOW energizes relay)
+const bool RELAY_ACTIVE_LOW = false;
+
+// Voltage Divider Configuration
+const float RTOP = 10000.0;  // Top resistor in Ohms
+const float RBOT = 1000.0;   // Bottom resistor in Ohms
+
+// ADC Configuration
+const float VREF = 3.3;
+const int ADC_MAX = 4095;
+const int SAMPLES = 200;
+
+// ============================================================================
+// DEFAULT VALUES (will be overridden by NVS or backend)
+// ============================================================================
+
+#define DEFAULT_WAKE_INTERVAL_MINUTES 15
+#define DEFAULT_V_CUTOFF 12.0
+#define DEFAULT_V_RECONNECT 12.6
+#define DEFAULT_CALIBRATION_FACTOR 1.0
+#define DEFAULT_RELAY_MODE "automatic"
+
+// ============================================================================
+// GLOBAL STATE VARIABLES
+// ============================================================================
+
+Preferences preferences;
+
+// Settings (loaded from NVS, updated by backend)
+uint32_t wakeIntervalMinutes = DEFAULT_WAKE_INTERVAL_MINUTES;
+float vCutoff = DEFAULT_V_CUTOFF;
+float vReconnect = DEFAULT_V_RECONNECT;
+float calibrationFactor = DEFAULT_CALIBRATION_FACTOR;
+String relayMode = DEFAULT_RELAY_MODE;  // "automatic", "force_on", "force_off"
+
+// Runtime state
+float lastVBat = 0.0;
+bool loadEnabled = true;
+
+// Cycle counting (persisted in RTC memory to survive deep sleep)
+RTC_DATA_ATTR unsigned long cycleCount = 0;
+RTC_DATA_ATTR bool rtcLoadEnabled = true;
+
+// ============================================================================
+// NVS PERSISTENCE FUNCTIONS
+// ============================================================================
+
+/**
+ * Load all settings from NVS
+ */
+void loadSettings() {
+  preferences.begin("voltmeter", true);  // Read-only
+  
+  calibrationFactor = preferences.getFloat("cal_factor", DEFAULT_CALIBRATION_FACTOR);
+  wakeIntervalMinutes = preferences.getUInt("wake_interval", DEFAULT_WAKE_INTERVAL_MINUTES);
+  vCutoff = preferences.getFloat("v_cutoff", DEFAULT_V_CUTOFF);
+  vReconnect = preferences.getFloat("v_reconnect", DEFAULT_V_RECONNECT);
+  relayMode = preferences.getString("relay_mode", DEFAULT_RELAY_MODE);
+  
+  preferences.end();
+  
+  Serial.println("Settings loaded from NVS:");
+  Serial.printf("  Calibration factor: %.4f\n", calibrationFactor);
+  Serial.printf("  Wake interval: %d min\n", wakeIntervalMinutes);
+  Serial.printf("  V_cutoff: %.2f V\n", vCutoff);
+  Serial.printf("  V_reconnect: %.2f V\n", vReconnect);
+  Serial.printf("  Relay mode: %s\n", relayMode.c_str());
+}
+
+/**
+ * Save a single float setting to NVS
+ */
+void saveFloat(const char* key, float value) {
+  preferences.begin("voltmeter", false);
+  preferences.putFloat(key, value);
+  preferences.end();
+}
+
+/**
+ * Save a single uint setting to NVS
+ */
+void saveUInt(const char* key, uint32_t value) {
+  preferences.begin("voltmeter", false);
+  preferences.putUInt(key, value);
+  preferences.end();
+}
+
+/**
+ * Save a single string setting to NVS
+ */
+void saveString(const char* key, const String& value) {
+  preferences.begin("voltmeter", false);
+  preferences.putString(key, value);
+  preferences.end();
+}
+
+// ============================================================================
+// RELAY CONTROL FUNCTIONS
+// ============================================================================
+
+/**
+ * Sets relay energization state
+ */
+void setRelayEnergized(bool energized) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_PIN, energized ? LOW : HIGH);
+  } else {
+    digitalWrite(RELAY_PIN, energized ? HIGH : LOW);
+  }
+}
+
+/**
+ * Applies load state and tracks changes
+ */
+void applyLoadState(bool wantLoadOn) {
+  if (loadEnabled != wantLoadOn) {
+    if (wantLoadOn) {
+      cycleCount++;
+      if (cycleCount >= 10000) cycleCount = 0;
+      Serial.printf("Cycle count: %lu\n", cycleCount);
+    }
+  }
+  
+  loadEnabled = wantLoadOn;
+  rtcLoadEnabled = wantLoadOn;
+  setRelayEnergized(wantLoadOn);
+}
+
+/**
+ * Apply relay logic based on mode and voltage
+ */
+void applyRelayLogic() {
+  Serial.printf("Applying relay logic (mode: %s, voltage: %.2f V)\n", 
+                relayMode.c_str(), lastVBat);
+  
+  if (relayMode == "force_on") {
+    Serial.println("  -> Force ON (ignoring voltage)");
+    applyLoadState(true);
+  } 
+  else if (relayMode == "force_off") {
+    Serial.println("  -> Force OFF (ignoring voltage)");
+    applyLoadState(false);
+  } 
+  else {
+    // Automatic mode - use hysteresis logic
+    if (lastVBat <= vCutoff) {
+      if (loadEnabled) {
+        Serial.printf("  -> Voltage LOW (<=%.2f) - turning OFF\n", vCutoff);
+        applyLoadState(false);
+      } else {
+        Serial.println("  -> Voltage LOW - already OFF");
+      }
+    } 
+    else if (lastVBat >= vReconnect) {
+      if (!loadEnabled) {
+        Serial.printf("  -> Voltage RECOVERED (>=%.2f) - turning ON\n", vReconnect);
+        applyLoadState(true);
+      } else {
+        Serial.println("  -> Voltage OK - already ON");
+      }
+    } 
+    else {
+      Serial.println("  -> Voltage in hysteresis zone - no change");
+    }
+  }
+  
+  Serial.printf("Load state: %s\n", loadEnabled ? "ON" : "OFF");
+}
+
+/**
+ * Holds relay GPIO during deep sleep
+ */
+void holdRelayPinDuringSleep() {
+  rtc_gpio_hold_dis((gpio_num_t)RELAY_PIN);
+  rtc_gpio_set_direction((gpio_num_t)RELAY_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
+  int level = digitalRead(RELAY_PIN);
+  rtc_gpio_set_level((gpio_num_t)RELAY_PIN, level);
+  rtc_gpio_hold_en((gpio_num_t)RELAY_PIN);
+  gpio_deep_sleep_hold_en();
+}
+
+// ============================================================================
+// VOLTAGE MEASUREMENT FUNCTIONS
+// ============================================================================
+
+/**
+ * Sort array for median calculation
+ */
+void sortArray(float arr[], int n) {
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (arr[j] > arr[j + 1]) {
+        float temp = arr[j];
+        arr[j] = arr[j + 1];
+        arr[j + 1] = temp;
+      }
+    }
+  }
+}
+
+/**
+ * Reads battery voltage with filtering and calibration
+ */
+float readBatteryVoltage() {
+  float samples[SAMPLES];
+  
+  for (int i = 0; i < SAMPLES; i++) {
+    samples[i] = (float)analogRead(ADC_PIN);
+    delayMicroseconds(500);
+  }
+  
+  sortArray(samples, SAMPLES);
+  
+  // Trim top and bottom 10%
+  int discard = SAMPLES / 10;
+  int start = discard;
+  int end = SAMPLES - discard;
+  int count = end - start;
+  
+  long sum = 0;
+  for (int i = start; i < end; i++) {
+    sum += (long)samples[i];
+  }
+  
+  float avgADC = (float)sum / (float)count;
+  float vAdc = (avgADC / (float)ADC_MAX) * VREF;
+  float vBat = vAdc * ((RTOP + RBOT) / RBOT);
+  
+  // Apply calibration
+  vBat = vBat * calibrationFactor;
+  
+  return vBat;
+}
+
+/**
+ * Reads raw battery voltage (no calibration) for calibration procedure
+ */
+float readBatteryVoltageRaw() {
+  float samples[SAMPLES];
+  
+  for (int i = 0; i < SAMPLES; i++) {
+    samples[i] = (float)analogRead(ADC_PIN);
+    delayMicroseconds(500);
+  }
+  
+  sortArray(samples, SAMPLES);
+  
+  int discard = SAMPLES / 10;
+  long sum = 0;
+  for (int i = discard; i < SAMPLES - discard; i++) {
+    sum += (long)samples[i];
+  }
+  
+  float avgADC = (float)sum / (float)(SAMPLES - 2 * discard);
+  float vAdc = (avgADC / (float)ADC_MAX) * VREF;
+  
+  // No calibration factor applied
+  return vAdc * ((RTOP + RBOT) / RBOT);
+}
+
+/**
+ * Performs calibration to target voltage
+ */
+void performCalibration(float targetVoltage) {
+  Serial.println("\n========================================");
+  Serial.println("  CALIBRATION PROCEDURE");
+  Serial.println("========================================");
+  Serial.printf("Target voltage: %.3f V\n", targetVoltage);
+  
+  // Take multiple raw readings for accuracy
+  const int CAL_SAMPLES = 60;
+  float sum = 0.0f;
+  
+  Serial.println("Taking raw voltage readings...");
+  for (int i = 0; i < CAL_SAMPLES; i++) {
+    sum += readBatteryVoltageRaw();
+    delay(30);
+    if (i % 10 == 0) Serial.print(".");
+  }
+  Serial.println();
+  
+  float measuredRaw = sum / (float)CAL_SAMPLES;
+  Serial.printf("Measured raw average: %.3f V\n", measuredRaw);
+  
+  if (measuredRaw > 0.1f) {
+    float newFactor = targetVoltage / measuredRaw;
+    
+    if (newFactor > 0.5f && newFactor < 2.0f) {
+      float oldFactor = calibrationFactor;
+      calibrationFactor = newFactor;
+      
+      // Save to NVS
+      saveFloat("cal_factor", calibrationFactor);
+      
+      Serial.printf("Old calibration factor: %.5f\n", oldFactor);
+      Serial.printf("New calibration factor: %.5f\n", calibrationFactor);
+      Serial.println("Calibration saved to NVS!");
+      
+      // Update lastVBat with new calibration
+      lastVBat = readBatteryVoltage();
+      Serial.printf("New calibrated reading: %.2f V\n", lastVBat);
+    } else {
+      Serial.printf("ERROR: Calculated factor %.5f is out of range (0.5-2.0)\n", newFactor);
+    }
+  } else {
+    Serial.println("ERROR: Raw reading too low, calibration aborted");
+  }
+  
+  Serial.println("========================================\n");
+}
+
+// ============================================================================
+// WIFI AND HTTP FUNCTIONS
+// ============================================================================
+
+/**
+ * Connects to WiFi with timeout
+ */
+bool connectWiFi() {
+  Serial.print("Connecting to WiFi");
+  
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+    delay(250);
+    Serial.print(".");
+  }
+  Serial.println();
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  } else {
+    Serial.println("WiFi connection failed");
+    return false;
+  }
+}
+
+/**
+ * Syncs time via NTP
+ */
+void syncTime() {
+  setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2", 1);
+  tzset();
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  
+  struct tm t;
+  for (int i = 0; i < 5; i++) {
+    if (getLocalTime(&t)) {
+      Serial.printf("Time: %04d-%02d-%02d %02d:%02d\n",
+        1900 + t.tm_year, 1 + t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min);
+      return;
+    }
+    delay(200);
+  }
+  Serial.println("Time sync failed");
+}
+
+/**
+ * Process commands received from backend
+ */
+void processCommands(JsonObject& commands) {
+  Serial.println("\nProcessing commands from backend...");
+  
+  bool settingsChanged = false;
+  
+  // Check relay mode
+  if (commands.containsKey("relay_mode")) {
+    String newMode = commands["relay_mode"].as<String>();
+    if (newMode != relayMode && 
+        (newMode == "automatic" || newMode == "force_on" || newMode == "force_off")) {
+      Serial.printf("  Relay mode: %s -> %s\n", relayMode.c_str(), newMode.c_str());
+      relayMode = newMode;
+      saveString("relay_mode", relayMode);
+      settingsChanged = true;
+    }
+  }
+  
+  // Check voltage thresholds
+  if (commands.containsKey("v_cutoff")) {
+    float newCutoff = commands["v_cutoff"].as<float>();
+    if (abs(newCutoff - vCutoff) > 0.01 && newCutoff >= 10.0 && newCutoff <= 14.0) {
+      Serial.printf("  V_cutoff: %.2f -> %.2f\n", vCutoff, newCutoff);
+      vCutoff = newCutoff;
+      saveFloat("v_cutoff", vCutoff);
+      settingsChanged = true;
+    }
+  }
+  
+  if (commands.containsKey("v_reconnect")) {
+    float newReconnect = commands["v_reconnect"].as<float>();
+    if (abs(newReconnect - vReconnect) > 0.01 && newReconnect >= 10.0 && newReconnect <= 14.0) {
+      // Ensure minimum hysteresis gap
+      if (newReconnect >= vCutoff + 0.3) {
+        Serial.printf("  V_reconnect: %.2f -> %.2f\n", vReconnect, newReconnect);
+        vReconnect = newReconnect;
+        saveFloat("v_reconnect", vReconnect);
+        settingsChanged = true;
+      } else {
+        Serial.printf("  V_reconnect %.2f rejected (must be >= %.2f)\n", 
+                      newReconnect, vCutoff + 0.3);
+      }
+    }
+  }
+  
+  // Check for calibration target
+  if (commands.containsKey("calibration_target") && !commands["calibration_target"].isNull()) {
+    float target = commands["calibration_target"].as<float>();
+    if (target >= 10.0 && target <= 15.0) {
+      Serial.printf("  Calibration requested: target = %.3f V\n", target);
+      performCalibration(target);
+      settingsChanged = true;
+    }
+  }
+  
+  if (!settingsChanged) {
+    Serial.println("  No changes needed");
+  }
+}
+
+/**
+ * Posts voltage data to backend and processes response
+ */
+bool postVoltageData() {
+  Serial.println("\nPosting data to backend...");
+  
+  // Build JSON payload using ArduinoJson
+  StaticJsonDocument<512> doc;
+  doc["sensor_id"] = SENSOR_ID;
+  doc["voltage_v"] = round(lastVBat * 1000) / 1000.0;  // 3 decimal places
+  doc["load_on"] = loadEnabled;
+  doc["relay_mode"] = relayMode;
+  doc["v_cutoff"] = vCutoff;
+  doc["v_reconnect"] = vReconnect;
+  doc["calibration_factor"] = calibrationFactor;
+  doc["cycle_count"] = cycleCount;
+  doc["wake_interval_minutes"] = wakeIntervalMinutes;
+  doc["uptime_ms"] = millis();
+  
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  Serial.println("Payload: " + jsonPayload);
+  
+  // Determine if HTTPS
+  bool useHTTPS = String(API_ENDPOINT).startsWith("https://");
+  
+  HTTPClient http;
+  WiFiClientSecure *secureClient = nullptr;
+  
+  if (useHTTPS) {
+    secureClient = new WiFiClientSecure;
+    secureClient->setInsecure();  // NOTE: Insecure for simplicity; consider proper cert pinning for production
+    if (!http.begin(*secureClient, API_ENDPOINT)) {
+      Serial.println("HTTP begin failed");
+      delete secureClient;
+      return false;
+    }
+  } else {
+    if (!http.begin(API_ENDPOINT)) {
+      Serial.println("HTTP begin failed");
+      return false;
+    }
+  }
+  
+  // Set headers
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("user-token", UPLOAD_TOKEN);
+  http.setTimeout(10000);  // 10 second timeout
+  
+  // Send POST
+  Serial.println("URL: " + String(API_ENDPOINT));
+  int httpCode = http.POST(jsonPayload);
+  bool success = false;
+  
+  if (httpCode > 0) {
+    Serial.printf("HTTP Response: %d\n", httpCode);
+    
+    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+      String response = http.getString();
+      Serial.println("Response: " + response);
+      
+      // Parse response for commands
+      StaticJsonDocument<512> responseDoc;
+      DeserializationError error = deserializeJson(responseDoc, response);
+      
+      if (!error && responseDoc.containsKey("commands")) {
+        JsonObject commands = responseDoc["commands"];
+        processCommands(commands);
+      }
+      
+      success = true;
+    }
+  } else {
+    Serial.printf("HTTP Error: %s\n", http.errorToString(httpCode).c_str());
+  }
+  
+  http.end();
+  if (secureClient) delete secureClient;
+  
+  return success;
+}
+
+// ============================================================================
+// DEEP SLEEP FUNCTION
+// ============================================================================
+
+void goToDeepSleep() {
+  Serial.println("\nPreparing for deep sleep...");
+  
+  // Hold relay state
+  holdRelayPinDuringSleep();
+  
+  // Turn off WiFi
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  
+  // Set wake timer
+  uint64_t sleepMicros = (uint64_t)wakeIntervalMinutes * 60ULL * 1000000ULL;
+  esp_sleep_enable_timer_wakeup(sleepMicros);
+  
+  Serial.printf("Sleeping for %d minutes...\n", wakeIntervalMinutes);
+  Serial.println("========================================\n");
+  Serial.flush();
+  
+  esp_deep_sleep_start();
+}
+
+// ============================================================================
+// SETUP - RUNS ONCE PER WAKE CYCLE
+// ============================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("  Battery Monitor v2.0");
+  Serial.println("  Power Optimized + Dashboard Control");
+  Serial.println("========================================");
+  
+  // Configure pins FIRST
+  pinMode(RELAY_PIN, OUTPUT);
+  analogReadResolution(12);
+  analogSetPinAttenuation(ADC_PIN, ADC_11db);
+  
+  // Restore relay state from RTC memory immediately
+  loadEnabled = rtcLoadEnabled;
+  setRelayEnergized(loadEnabled);
+  Serial.printf("Restored relay state: %s\n", loadEnabled ? "ON" : "OFF");
+  
+  // Load settings from NVS
+  loadSettings();
+  
+  // ========================================
+  // STEP 1: Read voltage
+  // ========================================
+  Serial.println("\n[1] Reading voltage...");
+  lastVBat = readBatteryVoltage();
+  Serial.printf("Battery: %.2f V (factor: %.4f)\n", lastVBat, calibrationFactor);
+  
+  // ========================================
+  // STEP 2: Connect WiFi
+  // ========================================
+  Serial.println("\n[2] Connecting WiFi...");
+  bool wifiConnected = connectWiFi();
+  
+  // ========================================
+  // STEP 3: Sync time
+  // ========================================
+  if (wifiConnected) {
+    Serial.println("\n[3] Syncing time...");
+    syncTime();
+  }
+  
+  // ========================================
+  // STEP 4: POST data and get commands
+  // ========================================
+  if (wifiConnected) {
+    Serial.println("\n[4] Communicating with backend...");
+    if (postVoltageData()) {
+      Serial.println("Communication successful!");
+    } else {
+      Serial.println("Communication failed (will retry next cycle)");
+    }
+  } else {
+    Serial.println("\n[4] Skipping backend (no WiFi)");
+  }
+  
+  // ========================================
+  // STEP 5: Apply relay logic
+  // ========================================
+  Serial.println("\n[5] Applying relay logic...");
+  Serial.printf("Thresholds: OFF at %.2f V, ON at %.2f V\n", vCutoff, vReconnect);
+  applyRelayLogic();
+  
+  // ========================================
+  // STEP 6: Enter deep sleep
+  // ========================================
+  Serial.println("\n[6] Entering deep sleep...");
+  goToDeepSleep();
+}
+
+// ============================================================================
+// LOOP - NOT USED
+// ============================================================================
+
+void loop() {
+  // Deep sleep restarts from setup()
+}
+
+// ============================================================================
+// END OF CODE
+// ============================================================================
+
+/*
+ * ============================================================================
  * Circuit Documentation
  * ============================================================================
  * 
